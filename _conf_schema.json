@@ -16,6 +16,12 @@
     "type": "int",
     "default": 10
   },
+  "map_in_push": {
+    "description": "推送时附带线路地图",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，到点推送会额外发一张「线路走向 + 车辆位置」的图片（底图来自高德公开瓦片，无需 key）。取不到瓦片时会自动降级为只有线路与车辆的简图。"
+  },
   "holiday_api": {
     "description": "自动获取在线节假日数据",
     "type": "bool",

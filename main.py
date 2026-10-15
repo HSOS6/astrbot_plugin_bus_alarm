@@ -14,15 +14,26 @@
     /buson  <编号>                    启用订阅
     /busoff <编号>                    暂停订阅
     /busnow <编号>                    立即查询一次
+    /busstop                          测试主动推送是否可用
     /buscalendar                      查看节假日 / 补班日数据
     /bushelp                          查看帮助
+
+Dashboard 插件页面（AstrBot WebUI → 插件 → 本插件卡片）：
+    pages/bus-alarm/ 提供图形化的订阅管理、线路查询与节假日查看，
+    后端接口在 webui.py 中注册，改动与指令共享同一份订阅数据。
+
+线路地图：
+    配置项 map_in_push 打开后，推送会在文字下方附一张「线路走向 + 车辆位置」
+    的图片（底图来自高德公开瓦片，无需 key），渲染逻辑见 map_render.py。
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import logging
+from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
@@ -37,7 +48,9 @@ from .alarm_store import (
 )
 from .bus_api import DEFAULT_CITY, BusApiError, BusClient, render_arrivals
 from .holiday_api import HolidayCalendar
+from .map_render import render_route_map
 from .scheduler import AlarmScheduler
+from .webui import BusAlarmWebUI
 
 logger = logging.getLogger("astrbot")
 
@@ -62,7 +75,9 @@ HELP_TEXT = (
     "/buson   <编号>  启用订阅\n"
     "/busoff  <编号>  暂停订阅\n"
     "/busnow  <编号>  立即查询一次\n"
-    "/buscalendar     查看节假日 / 补班日数据"
+    "/buscalendar     查看节假日 / 补班日数据\n"
+    "——————————————\n"
+    "也可以在 AstrBot WebUI 的插件页面里图形化管理订阅"
 )
 
 
@@ -101,6 +116,12 @@ class BusAlarm(Star):
         self.default_top_n = int(
             self._cfg("default_top_n", DEFAULT_TOP_N) or DEFAULT_TOP_N
         )
+        # 推送时是否附带「线路走向 + 车辆位置」地图
+        self.map_in_push = bool(self._cfg("map_in_push", True))
+
+        # Dashboard 插件页面的后端接口（页面在 pages/bus-alarm/ 下）
+        self.webui = BusAlarmWebUI(self, PLUGIN_NAME)
+        self.webui_paths = self.webui.register()
 
     def _cfg(self, key: str, default):
         try:
@@ -114,20 +135,23 @@ class BusAlarm(Star):
     async def initialize(self) -> None:
         if self.calendar is not None:
             self.calendar.load_cache()
-            self._sync_calendar()
+            self.sync_calendar()
             # 拉取在线数据可能耗时，放到后台，不阻塞插件加载
             self._calendar_task = asyncio.create_task(
                 self._refresh_calendar(), name="bus_alarm_calendar"
             )
         self.scheduler.start()
         logger.info(
-            "公交赶车闹钟已启动，默认城市 %s，当前 %d 条订阅，数据目录：%s\n节假日数据：%s",
+            "公交赶车闹钟已启动，默认城市 %s，当前 %d 条订阅，数据目录：%s\n"
+            "节假日数据：%s\n"
+            "WebUI 页面：pages/bus-alarm（%d 个接口）",
             self.client.default_city,
             len(self.store.all()),
             self.store.path.parent,
             self.calendar.describe()
             if self.calendar
             else "已关闭在线数据，仅按周末判断",
+            len(self.webui_paths),
         )
 
     async def terminate(self) -> None:
@@ -141,7 +165,7 @@ class BusAlarm(Star):
 
     # ---------------- 节假日日历 ----------------
 
-    def _sync_calendar(self) -> None:
+    def sync_calendar(self) -> None:
         """把在线数据与手填配置合并成最终判定集合。"""
         online_holidays = self.calendar.holidays if self.calendar else set()
         online_workdays = self.calendar.workdays if self.calendar else set()
@@ -154,7 +178,7 @@ class BusAlarm(Star):
             return
         try:
             if await self.calendar.ensure_fresh():
-                self._sync_calendar()
+                self.sync_calendar()
         except Exception:
             logger.exception("刷新节假日数据失败")
 
@@ -168,7 +192,7 @@ class BusAlarm(Star):
         return self.cities.get(event.unified_msg_origin, self.client.default_city)
 
     @staticmethod
-    def _parse_time(text: str) -> str:
+    def parse_time(text: str) -> str:
         """把用户输入的时间规范成 HH:MM。"""
         raw = (text or "").strip().replace("：", ":")
         try:
@@ -180,7 +204,7 @@ class BusAlarm(Star):
         except ValueError as exc:
             raise ValueError(f"时间格式不对：{raw}，请用 07:30 这样的格式") from exc
 
-    async def _resolve_station(
+    async def resolve_station(
         self, line_name: str, direction: int, station: str, city: str
     ) -> dict:
         """把用户输入的站序或站名解析成站点信息。"""
@@ -219,6 +243,66 @@ class BusAlarm(Star):
         raise ValueError(
             f"在 {line_name} 方向{direction} 里没找到「{token}」。前几站：{candidates}"
         )
+
+    async def build_map_image(
+        self,
+        line_name: str,
+        direction: int,
+        station_order: int,
+        station_name: str,
+        direction_to: str,
+        city: str,
+        result: dict,
+        route: dict | None = None,
+    ) -> str | None:
+        """渲染「线路走向 + 车辆位置」地图，返回 PNG 的 base64 字符串。
+
+        失败（线路没有经纬度、瓦片读不到、字体缺失等）时返回 None，
+        由调用方决定退回纯文字推送。
+        """
+        try:
+            if route is None:
+                route = await self.client.get_route(line_name, direction, city=city)
+            title = (
+                f"{line_name} · 往 {direction_to} · 候车 {station_name}"
+                if direction_to
+                else f"{line_name} · 候车 {station_name}"
+            )
+            png = await render_route_map(route, result, station_order, title)
+        except Exception:
+            logger.exception("渲染线路地图失败，本次只推送文字信息")
+            return None
+        return base64.b64encode(png).decode("ascii")
+
+    async def attach_map(
+        self,
+        chain: Any,
+        *,
+        line_name: str,
+        direction: int,
+        station_order: int,
+        station_name: str,
+        direction_to: str,
+        city: str,
+        result: dict,
+        route: dict | None = None,
+    ) -> Any:
+        """按配置把线路地图追加到消息链末尾（关闭或失败时原样返回）。"""
+        if not self.map_in_push:
+            return chain
+        image_b64 = await self.build_map_image(
+            line_name,
+            direction,
+            station_order,
+            station_name,
+            direction_to,
+            city,
+            result,
+            route=route,
+        )
+        if image_b64:
+            chain.base64_image(image_b64)
+        return chain
 
     def _describe(self, item: dict) -> str:
         status = "✅" if item.get("enabled", True) else "⏸"
@@ -393,7 +477,7 @@ class BusAlarm(Star):
     ):
         """添加公交到站提醒。用法：/busadd 07:30 工作日 1路 1 附小 [车辆数]"""
         try:
-            fire_time = self._parse_time(time_text)
+            fire_time = self.parse_time(time_text)
         except ValueError as exc:
             yield event.plain_result(str(exc))
             return
@@ -410,7 +494,7 @@ class BusAlarm(Star):
 
         city = self._city_for(event)
         try:
-            resolved = await self._resolve_station(line_name, direction, station, city)
+            resolved = await self.resolve_station(line_name, direction, station, city)
         except BusApiError as exc:
             yield event.plain_result(f"查询线路失败：{exc}")
             return
@@ -438,7 +522,7 @@ class BusAlarm(Star):
         yield event.plain_result(
             f"✅ 已添加提醒 [{item['id']}]\n"
             f"⏰ {fire_time} · {describe_repeat(repeat)}\n"
-            f"� [{city}] {item['line_name']}（往 {item['direction_to']}）· 候车：{item['station_name']}\n"
+            f"🚏 [{city}] {item['line_name']}（往 {item['direction_to']}）· 候车：{item['station_name']}\n"
             f"📊 将显示最近的 {item['top_n']} 辆车\n\n"
             f"到达时间后会主动推送，可先用 /busnow {item['id']} 试一下"
         )
@@ -548,7 +632,7 @@ class BusAlarm(Star):
             yield event.plain_result(f"查询失败：{exc}")
             return
 
-        yield event.plain_result(
+        chain = event.make_result().message(
             render_arrivals(
                 item["line_name"],
                 item.get("direction_to") or "",
@@ -557,6 +641,17 @@ class BusAlarm(Star):
                 city=city,
             )
         )
+        chain = await self.attach_map(
+            chain,
+            line_name=item["line_name"],
+            direction=int(item["direction"]),
+            station_order=int(item["station_order"]),
+            station_name=item.get("station_name") or "",
+            direction_to=item.get("direction_to") or "",
+            city=city,
+            result=result,
+        )
+        yield chain
 
     @filter.command("busstop")
     async def busstop(self, event: AstrMessageEvent):

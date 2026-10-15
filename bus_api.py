@@ -106,6 +106,17 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _parse_polyline(raw: Any) -> list[tuple[float, float]]:
+    """把 CMD=103 的 nihelist 解析成 [(lng, lat), ...]。"""
+    points: list[tuple[float, float]] = []
+    for item in raw or []:
+        lng = _to_float((item or {}).get("lng"))
+        lat = _to_float((item or {}).get("lat"))
+        if lng and lat:
+            points.append((lng, lat))
+    return points
+
+
 def _seg_speed(speedlist: list, index: int) -> float:
     """取第 index 段的速度（米/分钟），越界或用 0 时返回兜底值。"""
     if 0 <= index < len(speedlist):
@@ -306,7 +317,7 @@ class BusClient:
     async def get_route(
         self, line_name: str, direction: int, city: str | None = None
     ) -> dict:
-        """获取线路详情（站点表）。"""
+        """获取线路详情（站点表 + 道路拟合点）。"""
         result = await self._post(
             {"CMD": "103", "LINENAME": line_name, "DIRECTION": str(direction)},
             city=city,
@@ -330,6 +341,8 @@ class BusClient:
             "first_time": (first_last[0].get("first") if first_last else "") or "",
             "last_time": (first_last[0].get("last") if first_last else "") or "",
             "stations": stations,
+            # 道路拟合点（nihelist），画线路地图用；格式 [(lng, lat), ...]
+            "polyline": _parse_polyline(result.get("nihelist")),
         }
 
     async def _fetch_realtime(
@@ -359,13 +372,15 @@ class BusClient:
     ) -> dict:
         """查询候车站最近 top_n 辆车的到站情况。
 
-        返回 {ok, reason, arrivals, plan_time, data_time}
+        返回 {ok, reason, arrivals, buses, plan_time, data_time}
+        buses 是全部在途车辆的坐标与朝向（含已过候车站的车），画线路地图用。
         """
         result = await self._fetch_realtime(line_name, direction, station_order, city)
         out: dict[str, Any] = {
             "ok": True,
             "reason": "",
             "arrivals": [],
+            "buses": [],
             "plan_time": (result.get("planTime") or "").strip(),
             "data_time": "",
         }
@@ -409,6 +424,32 @@ class BusClient:
             )
         )
         out["arrivals"] = arrivals[: max(1, top_n)]
+
+        # 画线路地图用：全部在途车辆的坐标与朝向（含已经开过候车站的车）
+        buses_view: list[dict] = []
+        for bus in buses:
+            lat = _to_float(bus.get("bus_lat")) or _to_float(bus.get("station_lat"))
+            lng = (
+                _to_float(bus.get("bus_lng"))
+                or _to_float(bus.get("station_lng"))
+                or _to_float(bus.get("station_lon"))
+            )
+            if not lat or not lng:
+                continue
+            order = int(_to_float(bus.get("index"))) + 1
+            buses_view.append(
+                {
+                    "plate": str(bus.get("busNumber") or ""),
+                    "lat": lat,
+                    "lng": lng,
+                    "angle": _to_float(bus.get("angle")),
+                    "order": order,
+                    "passed": order > station_order,
+                    "stopped": str(bus.get("statusType", "")) == "0",
+                    "current_station": str(bus.get("stationName") or ""),
+                }
+            )
+        out["buses"] = buses_view
 
         rec_times = [_to_float(b.get("_recTime")) for b in buses if b.get("_recTime")]
         if rec_times:

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>公交赶车闹钟</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">🚌</span>
+        <div>
+          <h1>公交赶车闹钟</h1>
+          <p class="muted" id="subtitle">正在加载…</p>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <span class="pill" id="today-pill">—</span>
+        <button class="ghost" id="refresh-all">刷新</button>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="alarms">订阅</button>
+      <button class="tab" data-tab="editor">新建 / 编辑</button>
+      <button class="tab" data-tab="realtime">实时到站</button>
+      <button class="tab" data-tab="map">线路地图</button>
+      <button class="tab" data-tab="calendar">节假日</button>
+    </nav>
+
+    <main>
+      <!-- 订阅列表 -->
+      <section class="panel active" data-panel="alarms">
+        <div class="row between">
+          <div class="stats" id="stats"></div>
+          <div class="row gap">
+            <button class="ghost" data-goto="editor">＋ 新建订阅</button>
+          </div>
+        </div>
+        <div id="alarm-list" class="cards"></div>
+      </section>
+
+      <!-- 新建 / 编辑 -->
+      <section class="panel" data-panel="editor">
+        <div class="card">
+          <h2 id="editor-title">新建订阅</h2>
+          <div class="grid">
+            <label>
+              城市
+              <span class="row gap">
+                <input id="f-city" list="city-list" placeholder="留空使用默认城市" />
+                <button class="ghost" id="btn-cities">搜索城市</button>
+              </span>
+              <datalist id="city-list"></datalist>
+            </label>
+            <label>
+              线路
+              <span class="row gap">
+                <input id="f-line" placeholder="例如 1路" />
+                <button class="ghost" id="btn-lines">搜索线路</button>
+              </span>
+              <datalist id="line-list"></datalist>
+            </label>
+            <label>
+              方向
+              <select id="f-direction">
+                <option value="1">1 · 上行</option>
+                <option value="2">2 · 下行</option>
+              </select>
+            </label>
+            <label>
+              候车站
+              <input id="f-station" placeholder="站序数字或站名，如 12 或 附小" />
+              <small class="muted" id="station-hint"></small>
+            </label>
+            <label>
+              提醒时间
+              <input id="f-time" type="time" value="07:30" />
+            </label>
+            <label>
+              重复规则
+              <select id="f-repeat">
+                <option value="每天">每天</option>
+                <option value="工作日">工作日（跟随节假日与调休）</option>
+                <option value="非工作日">非工作日（含法定节假日）</option>
+                <option value="12345">周一至周五（不看调休）</option>
+                <option value="67">仅周末（不看调休）</option>
+                <option value="135">周一 / 周三 / 周五</option>
+                <option value="custom">自定义…</option>
+              </select>
+              <input id="f-repeat-custom" placeholder="自定义星期，如 1357（1=周一）" />
+            </label>
+            <label>
+              显示车辆数
+              <input id="f-topn" type="number" min="1" max="10" value="3" />
+            </label>
+            <label class="full">
+              推送目标会话
+              <span class="row gap">
+                <input id="f-umo" list="umo-list" placeholder="例如 aiocqhttp:GroupMessage:123456" />
+                <select id="umo-picker"></select>
+              </span>
+              <small class="muted">填已存在的会话即可复用；也可直接粘贴 umo。</small>
+              <datalist id="umo-list"></datalist>
+            </label>
+          </div>
+          <div class="row gap mt">
+            <button class="primary" id="btn-save">保存订阅</button>
+            <button class="ghost" id="btn-cancel">清空表单</button>
+            <button class="ghost" id="btn-preview">试查一次</button>
+            <span class="muted" id="editor-msg"></span>
+          </div>
+        </div>
+
+        <div class="card" id="route-card" hidden>
+          <h3 id="route-title"></h3>
+          <div id="route-stations" class="chips"></div>
+        </div>
+      </section>
+
+      <!-- 实时到站 -->
+      <section class="panel" data-panel="realtime">
+        <div class="card">
+          <div class="row gap wrap">
+            <label class="inline">
+              订阅
+              <select id="rt-picker"></select>
+            </label>
+            <button class="primary" id="btn-rt-query">查询实时到站</button>
+            <button class="ghost" id="btn-rt-push">查询并推送</button>
+          </div>
+          <p class="muted mt" id="rt-meta"></p>
+          <div id="rt-arrivals" class="cards"></div>
+        </div>
+      </section>
+
+      <!-- 线路地图 -->
+      <section class="panel" data-panel="map">
+        <div class="card">
+          <div class="row gap wrap">
+            <label class="inline">
+              订阅
+              <select id="map-picker"></select>
+            </label>
+            <button class="primary" id="btn-map-load">查看线路地图</button>
+            <span class="muted">底图来自高德公开瓦片，需要能访问外网</span>
+          </div>
+          <p class="muted mt" id="map-meta"></p>
+          <div class="map-box">
+            <div class="empty" id="map-empty">选择一条订阅后点「查看线路地图」</div>
+            <img id="map-image" alt="线路地图" hidden />
+          </div>
+          <div class="legend" id="map-legend">
+            <span class="legend-item"><i class="dot hot"></i>候选车辆（编号与推送顺序一致）</span>
+            <span class="legend-item"><i class="dot passed"></i>已开过候车站</span>
+            <span class="legend-item"><i class="dot idle"></i>其他在途车辆</span>
+            <span class="legend-item"><i class="dot target"></i>候车站</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 节假日 -->
+      <section class="panel" data-panel="calendar">
+        <div class="card">
+          <div class="row between">
+            <h2>节假日 / 调休数据</h2>
+            <button class="ghost" id="btn-cal-refresh">重新拉取</button>
+          </div>
+          <p class="muted" id="cal-desc"></p>
+          <p class="today-line" id="cal-today"></p>
+          <div class="grid2">
+            <div>
+              <h3>接下来的放假日</h3>
+              <div class="chips" id="cal-holidays"></div>
+            </div>
+            <div>
+              <h3>接下来的补班日</h3>
+              <div class="chips" id="cal-workdays"></div>
+            </div>
+          </div>
+          <p class="muted" id="cal-manual"></p>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

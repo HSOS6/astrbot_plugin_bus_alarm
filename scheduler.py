@@ -78,6 +78,7 @@ class AlarmScheduler:
         # 订阅自带城市；老数据没有就退回插件默认城市
         city = str(item.get("city") or self.plugin.client.default_city)
 
+        result: dict | None = None
         try:
             result = await self.plugin.client.query(
                 line_name, direction, station_order, top_n, city=city
@@ -97,7 +98,20 @@ class AlarmScheduler:
         if not umo:
             logger.warning("订阅 %s 缺少会话标识，无法推送", item.get("id"))
             return
+
+        chain = MessageChain().message(text)
+        if result is not None:
+            chain = await self.plugin.attach_map(
+                chain,
+                line_name=line_name,
+                direction=direction,
+                station_order=station_order,
+                station_name=station_name,
+                direction_to=item.get("direction_to") or "",
+                city=city,
+                result=result,
+            )
         try:
-            await self.plugin.context.send_message(umo, MessageChain().message(text))
+            await self.plugin.context.send_message(umo, chain)
         except Exception:
             logger.exception("向 %s 发送公交信息失败", umo)

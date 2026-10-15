@@ -5,6 +5,8 @@
 - 自定义提醒时间 + 日期规则（每天 / 工作日 / 非工作日 / 指定星期几）
 - 设定城市、候车站、公交线路、方向
 - 支持法定节假日与**调休补班日**（在线自动更新，无需手填）
+- 推送时附一张**线路地图**，标出线路走向、候车站与实时车辆位置
+- 自带 AstrBot **Dashboard 插件页面**，可图形化管理订阅
 - 数据来自「掌上公交」实时接口（h5.mygolbs.com）
 
 ## 效果
@@ -17,11 +19,14 @@
 ⏱ 数据时间 19:58
 ```
 
+文字下方还会附一张这样的图：底图是线路走向，绿点是你的候车站，
+红点（带序号）是候选车辆、黄点是已经过站的车辆、灰点是其他在途车辆。
+
 ## 安装
 
 1. 把 `astrbot_plugin_bus_alarm` 整个目录放到 AstrBot 的 `data/plugins/` 下
 2. 重启或热重载 AstrBot，在 WebUI「插件」页确认已加载
-3. 依赖只有 `httpx`，一般会自动装；没装上就手动 `pip install httpx`
+3. 依赖 `httpx` 与 `pillow`，一般会自动装；没装上就手动 `pip install httpx pillow`
 
 要求 AstrBot `>= 4.0.0`。
 
@@ -90,6 +95,43 @@
 
 订阅按会话隔离：在哪个群/私聊里加的，就推送到哪里。
 
+## WebUI 插件页面
+
+在 AstrBot WebUI 的「插件」页找到本插件卡片，点进去就是这个页面（源码在 `pages/bus-alarm/`）。
+页面与指令共用同一份订阅数据，改动立即生效，不用重启插件。
+
+| 标签页 | 能做什么 |
+| --- | --- |
+| 订阅 | 查看全部订阅（含暂停状态、今天是否生效），一键启用 / 暂停 / 删除 / 立即查询并推送 |
+| 新建 / 编辑 | 搜城市、搜线路、拉站点表，填时间和重复规则后保存 |
+| 实时到站 | 选一条订阅，查候车站最近几辆车 |
+| 线路地图 | 选一条订阅，看线路走向 + 当前车辆位置 |
+| 节假日 | 查看数据来源、今天的判定、接下来的放假 / 补班日，可手动重新拉取 |
+
+推送用的目标会话（`umo`）可以从「订阅」页已有的会话里下拉选择，不用手打。
+
+## 线路地图
+
+配置项 `map_in_push` 打开时，这些地方的消息都会在文字后附带一张地图：
+
+- 到点自动推送（`scheduler.py`）
+- `/busnow <编号>` 手动查询
+- WebUI 里的「立即查询并推送」和「线路地图」页
+
+地图上用颜色区分车辆状态：
+
+| 颜色 | 含义 |
+| --- | --- |
+| 绿色水滴 | 你的候车站 |
+| 红色圆点（带序号） | 候选车辆，序号与文字里的第 1、2… 辆一一对应 |
+| 黄色圆点 | 已经驶过候车站的车辆 |
+| 灰色圆点 | 其他在途车辆 |
+| 蓝色线条 | 线路走向（上游返回的道路拟合点，缺失时退化为站点连线） |
+
+底图用的是高德公开瓦片（`webrd0x.is.autonavi.com`，无需 key），所以**运行环境需要能访问外网**；
+取不到瓦片时会自动降级成「只有线路和站点、没有底图」的版本，不会影响推送。
+线路本身没有经纬度数据时（少数城市），则跳过地图、只发文字。
+
 ## 配置
 
 在 AstrBot WebUI 的插件配置页里改：
@@ -99,6 +141,7 @@
 | `default_city` | `三明市` | 插件默认城市，各会话可用 `/buscity` 单独覆盖 |
 | `default_top_n` | `3` | 默认推送最近几辆车 |
 | `request_timeout` | `10` | 接口超时（秒） |
+| `map_in_push` | `true` | 推送时是否附带线路地图（含实时车辆位置） |
 | `holiday_api` | `true` | 是否自动获取在线节假日数据。关掉后「工作日 / 非工作日」只按周末判断 |
 | `holiday_cache_days` | `7` | 节假日缓存有效期（天），过期自动重新拉取 |
 | `holidays` | 空 | 额外手填的放假日，如 `2026-01-01,2026-01-02`；与在线数据取并集 |
@@ -118,6 +161,9 @@
 - 备源 [timor.tech](https://timor.tech/api/holiday)
 - 主源失败会自动回退备源；结果缓存到 `data/plugin_data/astrbot_plugin_bus_alarm/holidays.json`
 - 次年的调休安排通常每年 11~12 月才公布，届时会随缓存过期自动拉到
+
+**地图底图**：高德公开瓦片 `https://webrd0{1-4}.is.autonavi.com/appmaptile?...`（中文注记，无需 key），
+只用于拼接推送里的静态图片，不涉及地理编码等其他服务。
 
 ## 工作原理
 
@@ -147,16 +193,20 @@ holidays.json        节假日缓存
 ```
 astrbot_plugin_bus_alarm/
 ├── metadata.yaml      插件元数据
-├── requirements.txt   依赖（httpx）
+├── requirements.txt   依赖（httpx、pillow）
 ├── _conf_schema.json  配置项定义
 ├── main.py            插件入口与指令
 ├── bus_api.py         实时公交接口封装与到站估算
+├── map_render.py      线路地图渲染（瓦片拼接 + 站点/车辆标注）
+├── webui.py           Dashboard 插件页面的后端接口
 ├── holiday_api.py     在线节假日 / 补班日
 ├── alarm_store.py     订阅与城市持久化、日期规则
-└── scheduler.py       定时调度与主动推送
+├── scheduler.py       定时调度与主动推送
+└── pages/bus-alarm/   Dashboard 插件页面（index.html + app.js + style.css）
 ```
 
 ## 用到的第三方资源
 
 - 实时数据：[掌上公交](https://h5.mygolbs.com/)（全国公交实时数据平台）
 - 节假日数据：[NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn)、[timor.tech](https://timor.tech/api/holiday)
+- 地图底图：高德地图公开瓦片服务
