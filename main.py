@@ -48,7 +48,6 @@ from .alarm_store import (
 )
 from .bus_api import DEFAULT_CITY, BusApiError, BusClient, render_arrivals
 from .holiday_api import HolidayCalendar
-from .map_render import render_route_map
 from .scheduler import AlarmScheduler
 from .webui import BusAlarmWebUI
 
@@ -261,6 +260,9 @@ class BusAlarm(Star):
         由调用方决定退回纯文字推送。
         """
         try:
+            # 惰性导入：Pillow 缺失时只影响地图，不阻断插件加载与页面显示
+            from .map_render import render_route_map
+
             if route is None:
                 route = await self.client.get_route(line_name, direction, city=city)
             title = (

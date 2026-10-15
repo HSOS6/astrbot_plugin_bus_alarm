@@ -1,11 +1,11 @@
 /**
  * 公交赶车闹钟 —— Dashboard 插件页面。
  *
- * 通过 AstrBot 注入的 bridge（window.AstrBotPluginPage）调用插件后端接口，
+ * 通过 AstrBot 注入的 bridge（window.AstrBotPluginView）调用插件后端接口，
  * 接口列表见 webui.py；与 QQ 指令共享同一份订阅数据。
  */
 
-const bridge = window.AstrBotPluginPage;
+const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
 
 const state = {
   city: "",
@@ -17,22 +17,25 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 
-/** 调用 GET 接口，失败时抛出带后端错误信息的异常。 */
-async function api(endpoint, params) {
-  const res = await bridge.apiGet(endpoint, params || {});
-  if (!res || !res.ok) {
-    throw new Error((res && res.error) || "请求失败");
+/**
+ * 校验 bridge 返回的响应：后端返回 `{"status":"error"}` 时抛出异常，
+ * 否则原样返回业务数据（AstrBot 已按约定解包，业务数据本身可能带 ok 字段）。
+ */
+function unwrap(res) {
+  if (res && res.status === "error") {
+    throw new Error(res.message || "请求失败");
   }
-  return res.data;
+  return res;
+}
+
+/** 调用 GET 接口。 */
+async function api(endpoint, params) {
+  return unwrap(await bridge.apiGet(endpoint, params || {}));
 }
 
 /** 调用 POST 接口。 */
 async function post(endpoint, body) {
-  const res = await bridge.apiPost(endpoint, body || {});
-  if (!res || !res.ok) {
-    throw new Error((res && res.error) || "请求失败");
-  }
-  return res.data;
+  return unwrap(await bridge.apiPost(endpoint, body || {}));
 }
 
 let toastTimer = 0;
@@ -659,6 +662,10 @@ function bind() {
 }
 
 async function main() {
+  if (!bridge || typeof bridge.ready !== "function") {
+    text($("#subtitle"), "未检测到 AstrBot 页面桥接，请从 AstrBot WebUI 的插件卡片进入本页");
+    return;
+  }
   const context = await bridge.ready();
   bind();
   try {

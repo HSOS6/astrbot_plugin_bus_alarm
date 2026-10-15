@@ -1,8 +1,14 @@
 """插件 WebUI（Dashboard 插件页面）的后端接口。
 
-AstrBot 会扫描插件目录下 `pages/<页面名>/index.html` 暴露 Dashboard 页面，
-页面里的 `window.AstrBotPluginPage` 会把请求转发到
-`/api/plug/<插件名>/<endpoint>`，所以这里注册的路由都必须带上插件名前缀。
+AstrBot 会扫描插件目录下的 `views/`（兼容旧名 `pages/`），把其中的
+`<页面名>/index.html` 暴露成 Dashboard 插件页面。页面通过 AstrBot 自动注入的
+bridge（`window.AstrBotPluginView`，旧别名 `window.AstrBotPluginPage`）发起请求，
+AstrBot 会转发到 `/api/v1/plugins/extensions/<插件名>/<endpoint>`
+（旧版 `/api/plug/<插件名>/<endpoint>` 仍兼容），所以这里注册的路由都带插件名前缀。
+
+返回约定：成功时直接返回业务 JSON（不要再套 `{"ok": true, "data": ...}`，
+否则会被 bridge 解包、前端拿到的就不是预期结构）；失败时返回
+`{"status": "error", "message": ...}`，前端据此判定为错误。
 
 页面与指令共享同一套订阅数据，改动立即生效，无需重启或重载插件。
 """
@@ -40,11 +46,13 @@ _REPEAT_SHORTCUTS = {
 
 
 def _ok(data: Any):
-    return jsonify({"ok": True, "data": data})
+    """成功：直接返回业务 JSON，交由 bridge 原样透传给页面。"""
+    return jsonify(data)
 
 
 def _fail(message: str):
-    return jsonify({"ok": False, "error": message})
+    """失败：返回 AstrBot 约定的错误结构，页面 bridge 会 reject 成 Error。"""
+    return jsonify({"status": "error", "message": message})
 
 
 def _as_int(value: Any, default: int = 0) -> int:
