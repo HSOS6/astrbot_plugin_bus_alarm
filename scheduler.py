@@ -75,16 +75,22 @@ class AlarmScheduler:
         station_order = int(item.get("station_order") or 1)
         station_name = item.get("station_name") or f"站序{station_order}"
         top_n = int(item.get("top_n") or self.plugin.default_top_n)
+        # 订阅自带城市；老数据没有就退回插件默认城市
+        city = str(item.get("city") or self.plugin.client.default_city)
 
         try:
             result = await self.plugin.client.query(
-                line_name, direction, station_order, top_n
+                line_name, direction, station_order, top_n, city=city
             )
         except BusApiError as exc:
-            text = f"🚌 {line_name} · 候车：{station_name}\n⚠️ 查询失败：{exc}"
+            text = f"🚌 [{city}] {line_name} · 候车：{station_name}\n⚠️ 查询失败：{exc}"
         else:
             text = render_arrivals(
-                line_name, item.get("direction_to") or "", station_name, result
+                line_name,
+                item.get("direction_to") or "",
+                station_name,
+                result,
+                city=city,
             )
 
         umo = item.get("umo")

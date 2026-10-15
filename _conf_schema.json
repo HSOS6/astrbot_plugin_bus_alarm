@@ -1,15 +1,9 @@
 {
-  "city_key": {
-    "description": "城市标识（citykey）",
-    "type": "string",
-    "default": "sm059800",
-    "hint": "三明市固定为 sm059800。其他城市可在掌上公交 H5 地址栏的 areacode 参数里找到。"
-  },
-  "city_name": {
-    "description": "城市名称",
+  "default_city": {
+    "description": "插件默认城市",
     "type": "string",
     "default": "三明市",
-    "hint": "接口要求传城市名，一般与 city_key 配套。"
+    "hint": "各会话可用 /buscity 单独切换；没设过的会话就用这里的城市。填城市全名，如「福州市」，用 /buscity list 可以查支持的城市。"
   },
   "default_top_n": {
     "description": "默认显示车辆数",

@@ -1,8 +1,8 @@
 name: astrbot_plugin_sm_bus_alarm
-display_name: 三明公交赶车闹钟
-desc: 按自定义时间与日期规则，主动推送三明公交候车站最近数辆车的到站信息，帮你判断几点出门赶车。
-short_desc: 三明公交到站提醒，到点推送最近几辆车还有几站。
-version: v1.0.0
+display_name: 公交赶车闹钟
+desc: 按自定义时间与日期规则，主动推送候车站最近数辆公交车的到站信息，帮你判断几点出门赶车。覆盖全国 500+ 城市，支持法定节假日与调休补班日。
+short_desc: 公交到站提醒，到点推送最近几辆车还有几站，全国可用。
+version: v1.1.0
 author: 懒鬼
 repo: ""
 astrbot_version: ">=4.0.0"

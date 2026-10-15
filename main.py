@@ -1,9 +1,11 @@
-"""三明公交赶车闹钟。
+"""公交赶车闹钟（全国版）。
 
 到达设定时间后，主动推送候车站最近数辆公交车的到站信息。
-数据源为三明「掌上公交」H5 接口（h5.mygolbs.com）。
+数据源为「掌上公交」H5 接口（h5.mygolbs.com），按城市名查询，覆盖全国 500+ 城市。
 
 指令：
+    /buscity [城市名]                 查看 / 切换所在城市
+    /buscity list [关键词]            查看支持的城市
     /buslines <线路名> [站点关键词]   查看线路站点与站序
     /busadd <HH:MM> <重复> <线路名> <方向> <站序或站名> [车辆数]
                                       添加订阅
@@ -27,12 +29,13 @@ from astrbot.api.star import Context, Star, StarTools
 
 from .alarm_store import (
     AlarmStore,
+    CityStore,
     RepeatRuleError,
     _split_dates,
     describe_repeat,
     parse_repeat,
 )
-from .bus_api import CITY_KEY, CITY_NAME, BusApiError, BusClient, render_arrivals
+from .bus_api import DEFAULT_CITY, BusApiError, BusClient, render_arrivals
 from .holiday_api import HolidayCalendar
 from .scheduler import AlarmScheduler
 
@@ -42,11 +45,14 @@ PLUGIN_NAME = "astrbot_plugin_sm_bus_alarm"
 DEFAULT_TOP_N = 3
 
 HELP_TEXT = (
-    "🚌 三明公交赶车闹钟\n"
+    "🚌 公交赶车闹钟\n"
     "——————————————\n"
-    "① 先查站序\n"
+    "⓪ 先确定城市（默认 {city}）\n"
+    "   /buscity 福州      切换城市\n"
+    "   /buscity list 泉州 搜索支持的城市\n"
+    "① 再查站序\n"
     "   /buslines 1路 附小\n"
-    "② 再加订阅\n"
+    "② 最后加订阅\n"
     "   /busadd 07:30 工作日 1路 1 附小 3\n"
     "   ⤷ 时间 HH:MM · 重复规则 · 线路 · 方向 · 站序或站名 · 显示车辆数\n"
     "   ⤷ 重复规则可填：每天 / 工作日 / 非工作日 / 12345(周几，1=周一)\n"
@@ -68,13 +74,13 @@ class SmBusAlarm(Star):
         self.config = config or {}
 
         self.client = BusClient(
-            city_key=self._cfg("city_key", CITY_KEY) or CITY_KEY,
-            city_name=self._cfg("city_name", CITY_NAME) or CITY_NAME,
+            default_city=self._cfg("default_city", DEFAULT_CITY) or DEFAULT_CITY,
             timeout=float(self._cfg("request_timeout", 10) or 10),
         )
 
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self.store = AlarmStore(data_dir)
+        self.cities = CityStore(data_dir)
         self.scheduler = AlarmScheduler(self)
 
         # 在线节假日数据（失败时自动退化为「只按周末判断」）
@@ -115,10 +121,13 @@ class SmBusAlarm(Star):
             )
         self.scheduler.start()
         logger.info(
-            "三明公交赶车闹钟已启动，当前 %d 条订阅，数据目录：%s\n节假日数据：%s",
+            "公交赶车闹钟已启动，默认城市 %s，当前 %d 条订阅，数据目录：%s\n节假日数据：%s",
+            self.client.default_city,
             len(self.store.all()),
             self.store.path.parent,
-            self.calendar.describe() if self.calendar else "已关闭在线数据，仅按周末判断",
+            self.calendar.describe()
+            if self.calendar
+            else "已关闭在线数据，仅按周末判断",
         )
 
     async def terminate(self) -> None:
@@ -154,6 +163,10 @@ class SmBusAlarm(Star):
 
     # ---------------- 工具方法 ----------------
 
+    def _city_for(self, event: AstrMessageEvent) -> str:
+        """当前会话使用的城市（用户用 /buscity 设过就用它，否则用插件默认）。"""
+        return self.cities.get(event.unified_msg_origin, self.client.default_city)
+
     @staticmethod
     def _parse_time(text: str) -> str:
         """把用户输入的时间规范成 HH:MM。"""
@@ -168,10 +181,10 @@ class SmBusAlarm(Star):
             raise ValueError(f"时间格式不对：{raw}，请用 07:30 这样的格式") from exc
 
     async def _resolve_station(
-        self, line_name: str, direction: int, station: str
+        self, line_name: str, direction: int, station: str, city: str
     ) -> dict:
         """把用户输入的站序或站名解析成站点信息。"""
-        route = await self.client.get_route(line_name, direction)
+        route = await self.client.get_route(line_name, direction, city=city)
         stations = route["stations"]
         if not stations:
             raise ValueError(f"没有找到 {line_name} 方向{direction} 的站点信息")
@@ -213,9 +226,10 @@ class SmBusAlarm(Star):
         target = (
             f"往 {direction_to}" if direction_to else f"方向{item.get('direction')}"
         )
+        city = str(item.get("city") or self.client.default_city)
         return (
             f"{status} [{item.get('id')}] {item.get('time')} · {describe_repeat(item.get('repeat'))}\n"
-            f"     {item.get('line_name')}（{target}）· 候车：{item.get('station_name')}"
+            f"     [{city}] {item.get('line_name')}（{target}）· 候车：{item.get('station_name')}"
             f" · 显示 {item.get('top_n', DEFAULT_TOP_N)} 辆"
         )
 
@@ -224,36 +238,110 @@ class SmBusAlarm(Star):
     @filter.command("bushelp")
     async def bushelp(self, event: AstrMessageEvent):
         """查看公交闹钟帮助"""
-        yield event.plain_result(HELP_TEXT)
+        yield event.plain_result(HELP_TEXT.format(city=self._city_for(event)))
+
+    @filter.command("buscity")
+    async def buscity(self, event: AstrMessageEvent, arg1: str = "", arg2: str = ""):
+        """查看或切换城市。用法：/buscity [城市名] 或 /buscity list [关键词]"""
+        current = self._city_for(event)
+        token = arg1.strip()
+
+        if not token:
+            yield event.plain_result(
+                f"📍 本会话当前城市：{current}\n\n"
+                "· 切换城市：/buscity 福州\n"
+                "· 搜索支持的城市：/buscity list 泉州\n"
+                "· 插件默认城市在插件配置 default_city 里改"
+            )
+            return
+
+        if token in ("list", "列表", "搜索"):
+            keyword = arg2.strip()
+            try:
+                cities = await self.client.list_cities()
+            except BusApiError as exc:
+                yield event.plain_result(f"获取城市列表失败：{exc}")
+                return
+            if keyword:
+                cities = [c for c in cities if keyword in c]
+            if not cities:
+                yield event.plain_result(f"没有找到含「{keyword}」的城市")
+                return
+            shown = cities[:40]
+            text = (
+                f"🏙 掌上公交支持 {len(cities)} 个城市"
+                + (f"（含「{keyword}」）" if keyword else "")
+                + "：\n"
+                + "、".join(shown)
+            )
+            if len(cities) > len(shown):
+                text += f"\n… 还有 {len(cities) - len(shown)} 个，加关键词缩小范围"
+            text += "\n\n用 /buscity <城市名> 切换"
+            yield event.plain_result(text)
+            return
+
+        # 切换城市：允许只写「福州」，会自动补「市」再校验
+        candidates = [token]
+        if not token.endswith("市"):
+            candidates.append(token + "市")
+        for candidate in candidates:
+            try:
+                exists = await self.client.city_exists(candidate)
+            except BusApiError as exc:
+                yield event.plain_result(f"查询城市失败：{exc}")
+                return
+            if exists:
+                self.cities.set(event.unified_msg_origin, candidate)
+                yield event.plain_result(
+                    f"✅ 已把本会话城市切换为「{candidate}」，之后的 /buslines 与 /busadd 都按这个城市查询"
+                )
+                return
+
+        try:
+            cities = await self.client.list_cities()
+        except BusApiError:
+            cities = []
+        similar = [c for c in cities if token.rstrip("市") and token.rstrip("市") in c][
+            :10
+        ]
+        text = f"❌ 掌上公交暂不支持「{token}」"
+        if similar:
+            text += "\n你是不是想找：" + "、".join(similar)
+        text += "\n用 /buscity list 关键词 搜索支持的城市"
+        yield event.plain_result(text)
 
     @filter.command("buslines")
     async def buslines(
         self, event: AstrMessageEvent, keyword: str = "", station: str = ""
     ):
-        """查看线路站点与站序。用法：/buslines 1路 [站点关键词]"""
+        """查看线路站点与站序。用法：/buslines <线路名> [站点关键词]"""
         if not keyword.strip():
             yield event.plain_result(
-                "用法：/buslines <线路名> [站点关键词]\n例如：/buslines 1路 附小"
+                "用法：/buslines <线路名> [站点关键词]\n"
+                "例如：/buslines 1路 附小\n"
+                "城市不对？先用 /buscity 切换"
             )
             return
 
         keyword = keyword.strip()
+        city = self._city_for(event)
         try:
-            lines = await self.client.search_lines(keyword)
+            lines = await self.client.search_lines(keyword, city=city)
         except BusApiError as exc:
             yield event.plain_result(f"查询失败：{exc}")
             return
 
         if not lines:
-            yield event.plain_result(f"没找到包含「{keyword}」的线路")
+            yield event.plain_result(
+                f"在「{city}」没找到包含「{keyword}」的线路\n"
+                "若城市不对，用 /buscity 切换；也可用 /buscity list 关键词 查看支持的城市"
+            )
             return
 
         # 关键字精确命中线路时直接展示站点，否则列出候选线路
         exact = [line for line in lines if line["line_name"] == keyword]
         if not exact:
-            text = (
-                f"🔍 包含「{keyword}」的线路共 {len(lines)} 条，请用完整线路名再试：\n"
-            )
+            text = f"🔍 {city} 包含「{keyword}」的线路共 {len(lines)} 条，请用完整线路名再试：\n"
             text += "\n".join(
                 f"· {line['line_name']}（方向{line['direction']}）{line['from']} → {line['to']}"
                 for line in lines[:14]
@@ -265,7 +353,9 @@ class SmBusAlarm(Star):
 
         line = exact[0]
         try:
-            route = await self.client.get_route(line["line_name"], line["direction"])
+            route = await self.client.get_route(
+                line["line_name"], line["direction"], city=city
+            )
         except BusApiError as exc:
             yield event.plain_result(f"查询站点失败：{exc}")
             return
@@ -278,11 +368,11 @@ class SmBusAlarm(Star):
                 yield event.plain_result(f"这条线上没有包含「{filter_token}」的站点")
                 return
             body = "\n".join(f"  {s['order']:>3}. {s['name']}" for s in matched)
-            head = f"🚏 {route['line_name']}（往 {route['to_station']}）匹配「{filter_token}」的站点："
+            head = f"🚏 [{city}] {route['line_name']}（往 {route['to_station']}）匹配「{filter_token}」的站点："
         else:
             shown = stations[:30]
             body = "\n".join(f"  {s['order']:>3}. {s['name']}" for s in shown)
-            head = f"🚏 {route['line_name']}（往 {route['to_station']}）共 {len(stations)} 站："
+            head = f"🚏 [{city}] {route['line_name']}（往 {route['to_station']}）共 {len(stations)} 站："
             if len(stations) > 30:
                 body += f"\n  … 还有 {len(stations) - 30} 站，可加关键词过滤"
 
@@ -318,8 +408,9 @@ class SmBusAlarm(Star):
             yield event.plain_result("方向只能是 1（上行）或 2（下行）")
             return
 
+        city = self._city_for(event)
         try:
-            resolved = await self._resolve_station(line_name, direction, station)
+            resolved = await self._resolve_station(line_name, direction, station, city)
         except BusApiError as exc:
             yield event.plain_result(f"查询线路失败：{exc}")
             return
@@ -333,6 +424,7 @@ class SmBusAlarm(Star):
                 "umo": event.unified_msg_origin,
                 "time": fire_time,
                 "repeat": repeat,
+                "city": city,
                 "line_name": route["line_name"],
                 "direction": direction,
                 "direction_to": route["to_station"],
@@ -346,7 +438,7 @@ class SmBusAlarm(Star):
         yield event.plain_result(
             f"✅ 已添加提醒 [{item['id']}]\n"
             f"⏰ {fire_time} · {describe_repeat(repeat)}\n"
-            f"🚌 {item['line_name']}（往 {item['direction_to']}）· 候车：{item['station_name']}\n"
+            f"� [{city}] {item['line_name']}（往 {item['direction_to']}）· 候车：{item['station_name']}\n"
             f"📊 将显示最近的 {item['top_n']} 辆车\n\n"
             f"到达时间后会主动推送，可先用 /busnow {item['id']} 试一下"
         )
@@ -443,12 +535,14 @@ class SmBusAlarm(Star):
             yield event.plain_result(f"没有找到编号为 {sub_id} 的订阅")
             return
 
+        city = str(item.get("city") or self.client.default_city)
         try:
             result = await self.client.query(
                 item["line_name"],
                 int(item["direction"]),
                 int(item["station_order"]),
                 int(item.get("top_n") or self.default_top_n),
+                city=city,
             )
         except BusApiError as exc:
             yield event.plain_result(f"查询失败：{exc}")
@@ -460,6 +554,7 @@ class SmBusAlarm(Star):
                 item.get("direction_to") or "",
                 item.get("station_name") or "",
                 result,
+                city=city,
             )
         )
 

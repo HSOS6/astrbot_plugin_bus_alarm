@@ -1,15 +1,19 @@
-"""三明公交实时到站数据接口封装。
+"""掌上公交实时到站数据接口封装（全国通用）。
 
 数据源：掌上公交 H5（https://h5.mygolbs.com/），协议逆向自其前端 js/mybus.js。
 
+接口按 **城市名（CITYNAME）** 区分城市，不需要 citykey，
+所以三明、福州、厦门、北京等都能查（个别城市未开通实时数据）。
+
 要点：
 1. 接口为 form-urlencoded 的 POST：https://h5.mygolbs.com/ApiData.do
-2. **必须先 GET 首页预热 Cookie**，否则服务端会返回一段固定密文而不是 JSON。
+2. **必须先 GET 首页预热会话**，否则服务端会返回一段固定密文而不是 JSON。
 3. 必须携带 Referer / Origin / X-Requested-With，否则同样拿不到明文。
 4. 所有请求通过 CMD 字段路由：
-   - 205 城市配置校验
+   - 101 全国城市列表（只返回城市名，共 500+ 个）
+   - 204 城市校验（status=1 表示该城市可用）
    - 119 按关键字搜索线路（返回线路名 + 方向 + 起终点）
-   - 103 线路详情（站点列表 + 线路折线点）
+   - 103 线路详情（站点列表 + 首末班）
    - 104 实时到站（车辆列表 + 每段距离 + 每段速度）
 
 「还有几站 / 约几分钟」的算法完全复刻自 js/mybus.js 的 getDistance / getCostTimes：
@@ -27,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,11 +41,13 @@ logger = logging.getLogger("astrbot")
 
 BASE_URL = "https://h5.mygolbs.com"
 API_URL = BASE_URL + "/ApiData.do"
-WARMUP_URL = BASE_URL + "/?areacode={city_key}"
+WARMUP_URL = BASE_URL + "/"
 
-# 三明市：citykey 就是官网嵌入 iframe 里的 areacode
-CITY_KEY = "sm059800"
-CITY_NAME = "三明市"
+# 默认城市（插件配置里可改，用户也能用 /buscity 切换）
+DEFAULT_CITY = "三明市"
+
+# 城市列表缓存有效期（秒），一个月刷新一次就够了
+_CITY_CACHE_SECONDS = 30 * 24 * 3600
 
 _UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -161,19 +168,17 @@ class BusClient:
 
     def __init__(
         self,
-        city_key: str = CITY_KEY,
-        city_name: str = CITY_NAME,
+        default_city: str = DEFAULT_CITY,
         timeout: float = 10.0,
     ) -> None:
-        self.city_key = city_key
-        self.city_name = city_name
+        self.default_city = default_city
         self._timeout = timeout
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers={
                 "User-Agent": _UA,
-                "Referer": WARMUP_URL.format(city_key=city_key),
+                "Referer": WARMUP_URL,
                 "Origin": BASE_URL,
                 "X-Requested-With": "XMLHttpRequest",
                 "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -183,24 +188,39 @@ class BusClient:
         )
         self._warmed = False
         self._lock = asyncio.Lock()
+        self._cities: list[str] = []
+        self._cities_at = 0.0
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def _warmup(self) -> None:
-        """GET 首页以获取会话 Cookie。"""
+        """GET 首页以获取会话。"""
         async with self._lock:
             if self._warmed:
                 return
             try:
-                await self._client.get(WARMUP_URL.format(city_key=self.city_key))
+                await self._client.get(WARMUP_URL)
             except httpx.HTTPError as exc:
                 raise BusApiError(f"会话预热失败：{exc}") from exc
             self._warmed = True
 
-    async def _post(self, payload: dict, retry: bool = True) -> dict:
+    async def _post(
+        self,
+        payload: dict,
+        city: str | None = None,
+        retry: bool = True,
+        expect_ok: bool = True,
+    ) -> dict:
+        """city=None 用默认城市；city="" 表示不传 CITYNAME（城市列表 / 城市校验用）。
+
+        expect_ok=False 时不把 status != 1 当失败，交给调用方判断。
+        """
         await self._warmup()
-        data = {"CITYKEY": self.city_key, "CITYNAME": self.city_name, **payload}
+        data = dict(payload)
+        resolved = self.default_city if city is None else city
+        if resolved:
+            data["CITYNAME"] = resolved
         try:
             resp = await self._client.post(API_URL, data=data)
             resp.raise_for_status()
@@ -210,20 +230,53 @@ class BusClient:
                 # 会话过期时服务端会返回密文（JSON 解析失败），重新预热后再试一次
                 self._warmed = False
                 logger.debug("mygolbs 请求失败，重新预热会话后重试：%s", exc)
-                return await self._post(payload, retry=False)
+                return await self._post(
+                    payload, city=city, retry=False, expect_ok=expect_ok
+                )
             raise BusApiError(f"请求公交接口失败：{exc}") from exc
 
         if not isinstance(result, dict):
             raise BusApiError("公交接口返回格式异常")
-        if int(result.get("status", 0)) != 1:
+        if expect_ok and int(result.get("status", 0)) != 1:
             raise BusApiError(str(result.get("msg") or "公交接口返回失败"))
         return result
 
+    # ---------------- 城市 ----------------
+
+    async def list_cities(self, refresh: bool = False) -> list[str]:
+        """全国可用城市名列表（CMD=101）。带内存缓存，默认一个月刷新。"""
+        if (
+            not refresh
+            and self._cities
+            and time.monotonic() - self._cities_at < _CITY_CACHE_SECONDS
+        ):
+            return self._cities
+
+        result = await self._post({"CMD": "101"}, city="")
+        cities = [
+            str(item.get("cityname") or "").strip()
+            for item in (result.get("data") or [])
+            if item.get("cityname")
+        ]
+        if cities:
+            self._cities = cities
+            self._cities_at = time.monotonic()
+        return self._cities
+
+    async def city_exists(self, city_name: str) -> bool:
+        """向 CMD=204 确认城市是否开通（未开通返回 status=-1）。网络异常会抛出 BusApiError。"""
+        result = await self._post(
+            {"CMD": "204", "CITYNAME": city_name}, city="", expect_ok=False
+        )
+        return int(_to_float(result.get("status"))) == 1
+
     # ---------------- 对外方法 ----------------
 
-    async def search_lines(self, keyword: str = "") -> list[dict]:
+    async def search_lines(
+        self, keyword: str = "", city: str | None = None
+    ) -> list[dict]:
         """按关键字搜索线路，返回 [{line_name, direction, from, to, company}]。"""
-        result = await self._post({"CMD": "119", "KEY": keyword})
+        result = await self._post({"CMD": "119", "KEY": keyword}, city=city)
         # 注意：CMD=119 的 buslines 在顶层，不像其他 CMD 那样包在 data 里
         raw = result.get("buslines")
         if raw is None and isinstance(result.get("data"), dict):
@@ -250,10 +303,13 @@ class BusClient:
             )
         return lines
 
-    async def get_route(self, line_name: str, direction: int) -> dict:
+    async def get_route(
+        self, line_name: str, direction: int, city: str | None = None
+    ) -> dict:
         """获取线路详情（站点表）。"""
         result = await self._post(
-            {"CMD": "103", "LINENAME": line_name, "DIRECTION": str(direction)}
+            {"CMD": "103", "LINENAME": line_name, "DIRECTION": str(direction)},
+            city=city,
         )
         stations = [
             {
@@ -277,7 +333,11 @@ class BusClient:
         }
 
     async def _fetch_realtime(
-        self, line_name: str, direction: int, station_order: int
+        self,
+        line_name: str,
+        direction: int,
+        station_order: int,
+        city: str | None = None,
     ) -> dict:
         return await self._post(
             {
@@ -285,7 +345,8 @@ class BusClient:
                 "LINENAME": line_name,
                 "DIRECTION": str(direction),
                 "STATIONORDER": str(station_order),
-            }
+            },
+            city=city,
         )
 
     async def query(
@@ -294,12 +355,13 @@ class BusClient:
         direction: int,
         station_order: int,
         top_n: int = 3,
+        city: str | None = None,
     ) -> dict:
         """查询候车站最近 top_n 辆车的到站情况。
 
         返回 {ok, reason, arrivals, plan_time, data_time}
         """
-        result = await self._fetch_realtime(line_name, direction, station_order)
+        result = await self._fetch_realtime(line_name, direction, station_order, city)
         out: dict[str, Any] = {
             "ok": True,
             "reason": "",
@@ -314,7 +376,7 @@ class BusClient:
             return out
         if int(_to_float(result.get("hasReal"), 1)) == 0:
             out["ok"] = False
-            out["reason"] = "该线路未开通实时数据查询"
+            out["reason"] = "这条线路还没开通实时到站数据（部分城市整体未开通）"
             return out
 
         dislist = result.get("dislist") or []
@@ -359,10 +421,12 @@ def render_arrivals(
     direction_to: str,
     station_name: str,
     result: dict,
-    line_prefix: str = "",
+    city: str = "",
 ) -> str:
     """把查询结果渲染成推送文案。"""
-    title = f"🚌 {line_prefix}{line_name}"
+    title = f"🚌 {line_name}"
+    if city:
+        title = f"🚌 [{city}] {line_name}"
     if direction_to:
         title += f"（往 {direction_to}）"
     title += f" · 候车：{station_name}"

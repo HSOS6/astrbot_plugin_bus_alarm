@@ -249,3 +249,51 @@ class AlarmStore:
             return
         item["last_fire_date"] = date_iso
         self.save()
+
+
+class CityStore:
+    """会话级默认城市（umo → 城市名），JSON 持久化。
+
+    订阅本身也会记下自己的城市，所以用户之后换城市不影响已有提醒。
+    """
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = Path(data_dir) / "session_cities.json"
+        self._items: dict[str, str] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except (OSError, ValueError) as exc:
+            logger.error("读取会话城市文件失败：%s", exc)
+            return
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if isinstance(items, dict):
+            self._items = {str(k): str(v) for k, v in items.items() if v}
+
+    def save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(self.path.parent),
+                delete=False,
+                suffix=".tmp",
+            ) as fp:
+                json.dump({"items": self._items}, fp, ensure_ascii=False, indent=2)
+                tmp_path = fp.name
+            os.replace(tmp_path, self.path)
+        except OSError as exc:
+            logger.error("保存会话城市文件失败：%s", exc)
+
+    def get(self, umo: str, default: str) -> str:
+        return self._items.get(str(umo)) or default
+
+    def set(self, umo: str, city: str) -> None:
+        self._items[str(umo)] = city
+        self.save()

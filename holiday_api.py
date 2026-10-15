@@ -39,7 +39,9 @@ class HolidayCalendar:
 
     CACHE_FILENAME = "holidays.json"
 
-    def __init__(self, data_dir: Path, timeout: float = 10.0, cache_days: int = 7) -> None:
+    def __init__(
+        self, data_dir: Path, timeout: float = 10.0, cache_days: int = 7
+    ) -> None:
         self.path = Path(data_dir) / self.CACHE_FILENAME
         self.cache_days = max(1, int(cache_days))
         self.timeout = timeout
