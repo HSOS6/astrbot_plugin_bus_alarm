@@ -16,9 +16,9 @@ AstrBot 会转发到 `/api/v1/plugins/extensions/<插件名>/<endpoint>`
 from __future__ import annotations
 
 import datetime as dt
-import logging
 from typing import Any
 
+from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from quart import jsonify, request
 
@@ -33,8 +33,6 @@ from .alarm_store import (
     parse_repeat,
 )
 from .bus_api import Arrival, BusApiError, render_arrivals
-
-logger = logging.getLogger("astrbot")
 
 DIRECTION_LABEL = {1: "上行", 2: "下行"}
 

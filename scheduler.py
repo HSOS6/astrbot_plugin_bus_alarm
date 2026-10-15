@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import logging
 
+from astrbot.api import logger
 from astrbot.api.event import MessageChain
 
 from .alarm_store import AlarmStore
 from .bus_api import BusApiError, render_arrivals
-
-logger = logging.getLogger("astrbot")
 
 TICK_SECONDS = 30
 

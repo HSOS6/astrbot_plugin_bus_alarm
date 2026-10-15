@@ -32,9 +32,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
-import logging
 from typing import Any
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
@@ -50,8 +50,6 @@ from .bus_api import DEFAULT_CITY, BusApiError, BusClient, render_arrivals
 from .holiday_api import HolidayCalendar
 from .scheduler import AlarmScheduler
 from .webui import BusAlarmWebUI
-
-logger = logging.getLogger("astrbot")
 
 PLUGIN_NAME = "astrbot_plugin_bus_alarm"
 DEFAULT_TOP_N = 3

@@ -13,14 +13,12 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-import logging
 import os
 import tempfile
 from pathlib import Path
 
 import httpx
-
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 HOLIDAY_CN_URL = "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
 TIMOR_URL = "https://timor.tech/api/holiday/year/{year}"

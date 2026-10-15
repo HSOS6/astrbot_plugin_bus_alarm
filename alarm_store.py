@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 RULE_EVERYDAY = "everyday"
 RULE_WORKDAY = "workday"

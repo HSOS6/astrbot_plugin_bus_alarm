@@ -30,14 +30,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 BASE_URL = "https://h5.mygolbs.com"
 API_URL = BASE_URL + "/ApiData.do"

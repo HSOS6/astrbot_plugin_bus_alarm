@@ -17,15 +17,13 @@ from __future__ import annotations
 import asyncio
 import io
 import itertools
-import logging
 import math
 from functools import lru_cache
 from pathlib import Path
 
 import httpx
+from astrbot.api import logger
 from PIL import Image, ImageDraw, ImageFont
-
-logger = logging.getLogger("astrbot")
 
 TILE_SIZE = 256
 _TILE_URL = (
