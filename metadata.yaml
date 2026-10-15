@@ -4,7 +4,12 @@ desc: 按自定义时间与日期规则，主动推送候车站最近数辆公�
 short_desc: 公交到站提醒，到点推送最近几辆车还有几站，附带线路地图，全国可用。
 version: v1.2.0
 author: 星见雅
-repo: ""
+repo: https://github.com/HSOS6/astrbot_plugin_bus_alarm
+tags:
+  - 生活服务
+  - 公共交通
+  - 定时提醒
+  - 地图
 astrbot_version: ">=4.0.0"
 support_platforms:
   - aiocqhttp
