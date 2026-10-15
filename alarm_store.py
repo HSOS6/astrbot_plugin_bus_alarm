@@ -87,10 +87,12 @@ def describe_repeat(rule: dict) -> str:
         return "非工作日"
     if rule_type == RULE_WEEKDAYS:
         days = sorted(rule.get("days") or [])
+        # 注意：这里只按星期判断，不含节假日 / 调休逻辑，
+        # 所以不能显示成「工作日」「非工作日」，以免和同名规则混淆
         if days == [1, 2, 3, 4, 5]:
-            return "工作日"
+            return "周一至周五"
         if days == [6, 7]:
-            return "非工作日"
+            return "周六、周日"
         return "、".join(WEEKDAY_NAMES.get(d, str(d)) for d in days) or "每天"
     return "每天"
 
