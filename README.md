@@ -19,7 +19,7 @@
 
 ## 安装
 
-1. 把 `astrbot_plugin_sm_bus_alarm` 整个目录放到 AstrBot 的 `data/plugins/` 下
+1. 把 `astrbot_plugin_bus_alarm` 整个目录放到 AstrBot 的 `data/plugins/` 下
 2. 重启或热重载 AstrBot，在 WebUI「插件」页确认已加载
 3. 依赖只有 `httpx`，一般会自动装；没装上就手动 `pip install httpx`
 
@@ -116,7 +116,7 @@
 
 - 主源 [holiday-cn](https://github.com/NateScarlet/holiday-cn)（jsDelivr 分发的静态 JSON，依据国务院办公厅放假通知文件）
 - 备源 [timor.tech](https://timor.tech/api/holiday)
-- 主源失败会自动回退备源；结果缓存到 `data/plugin_data/astrbot_plugin_sm_bus_alarm/holidays.json`
+- 主源失败会自动回退备源；结果缓存到 `data/plugin_data/astrbot_plugin_bus_alarm/holidays.json`
 - 次年的调休安排通常每年 11~12 月才公布，届时会随缓存过期自动拉到
 
 ## 工作原理
@@ -127,7 +127,7 @@
 2. 取出到点且今天应当触发的订阅（用 `last_fire_date` 防止当天重复触发）
 3. 按订阅记下的城市查询实时到站，通过 `context.send_message()` 主动推送到订阅所在会话
 
-订阅与缓存在 `data/plugin_data/astrbot_plugin_sm_bus_alarm/` 下：
+订阅与缓存在 `data/plugin_data/astrbot_plugin_bus_alarm/` 下：
 
 ```
 subscriptions.json   订阅数据（每条含 city）
@@ -145,7 +145,7 @@ holidays.json        节假日缓存
 ## 文件结构
 
 ```
-astrbot_plugin_sm_bus_alarm/
+astrbot_plugin_bus_alarm/
 ├── metadata.yaml      插件元数据
 ├── requirements.txt   依赖（httpx）
 ├── _conf_schema.json  配置项定义

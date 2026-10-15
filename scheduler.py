@@ -28,7 +28,7 @@ class AlarmScheduler:
     def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
-        self._task = asyncio.create_task(self._loop(), name="sm_bus_alarm_scheduler")
+        self._task = asyncio.create_task(self._loop(), name="bus_alarm_scheduler")
 
     async def stop(self) -> None:
         if self._task is None:

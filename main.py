@@ -41,7 +41,7 @@ from .scheduler import AlarmScheduler
 
 logger = logging.getLogger("astrbot")
 
-PLUGIN_NAME = "astrbot_plugin_sm_bus_alarm"
+PLUGIN_NAME = "astrbot_plugin_bus_alarm"
 DEFAULT_TOP_N = 3
 
 HELP_TEXT = (
@@ -66,7 +66,7 @@ HELP_TEXT = (
 )
 
 
-class SmBusAlarm(Star):
+class BusAlarm(Star):
     """公交赶车闹钟插件。"""
 
     def __init__(self, context: Context, config: dict | None = None) -> None:
@@ -117,7 +117,7 @@ class SmBusAlarm(Star):
             self._sync_calendar()
             # 拉取在线数据可能耗时，放到后台，不阻塞插件加载
             self._calendar_task = asyncio.create_task(
-                self._refresh_calendar(), name="sm_bus_alarm_calendar"
+                self._refresh_calendar(), name="bus_alarm_calendar"
             )
         self.scheduler.start()
         logger.info(
