@@ -1,0 +1,49 @@
+{
+  "city_key": {
+    "description": "城市标识（citykey）",
+    "type": "string",
+    "default": "sm059800",
+    "hint": "三明市固定为 sm059800。其他城市可在掌上公交 H5 地址栏的 areacode 参数里找到。"
+  },
+  "city_name": {
+    "description": "城市名称",
+    "type": "string",
+    "default": "三明市",
+    "hint": "接口要求传城市名，一般与 city_key 配套。"
+  },
+  "default_top_n": {
+    "description": "默认显示车辆数",
+    "type": "int",
+    "default": 3,
+    "hint": "推送时展示离候车站最近的几辆车。"
+  },
+  "request_timeout": {
+    "description": "接口超时时间（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "holiday_api": {
+    "description": "自动获取在线节假日数据",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后自动拉取放假与调休补班日，让「工作日 / 非工作日」规则识别法定节假日。数据来源 holiday-cn（jsDelivr），失败时回退 timor.tech。"
+  },
+  "holiday_cache_days": {
+    "description": "节假日缓存有效期（天）",
+    "type": "int",
+    "default": 7,
+    "hint": "超过这个天数会重新拉取在线数据。调休安排一般每年 11~12 月公布。"
+  },
+  "holidays": {
+    "description": "额外的手填放假日（逗号分隔）",
+    "type": "text",
+    "default": "",
+    "hint": "可选。格式 2026-01-01,2026-01-02，用于补充在线数据没有覆盖的日期（如公司自己的假期）。"
+  },
+  "workdays": {
+    "description": "额外的手填补班日（逗号分隔）",
+    "type": "text",
+    "default": "",
+    "hint": "可选。格式 2026-02-14。这些日期即使落在周末也算工作日。"
+  }
+}
