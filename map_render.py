@@ -2,7 +2,9 @@
 
 底图用高德公开的栅格瓦片（webrd0x.is.autonavi.com，无需 key，国内可直连），
 线路走向来自 CMD=103 的 nihelist（道路拟合点），
-车辆坐标来自 CMD=104 的 bus_lat / bus_lng / angle。
+车辆坐标来自 CMD=104 的 bus_lat / bus_lng / angle，
+站间路况（绿=畅通 / 橙=缓行 / 红=拥堵）来自 CMD=104 的 speedlist[].co，
+配合站点上的 StationNihePointIndex 把线路切成一段段着色。
 
 三个前提：
 1. 只用 Pillow 画图，不引入地图 SDK —— AstrBot 运行时自带 Pillow。
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import itertools
 import logging
 import math
 from functools import lru_cache
@@ -38,12 +41,23 @@ _UA = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
+# 没有路况数据时的线路主色（有路况则按段着色）
 _ROUTE_COLOR = (24, 92, 235)
 _ROUTE_CASING = (255, 255, 255)
-_BUS_COLOR = (232, 62, 40)
-_BUS_PASSED_COLOR = (250, 173, 20)
-_BUS_IDLE_COLOR = (140, 146, 158)
-_TARGET_COLOR = (8, 158, 82)
+# 路况三色，来自 CMD=104 的 speedlist[].co
+_TRAFFIC_COLORS = {
+    "green": (34, 197, 94),
+    "orange": (245, 158, 11),
+    "red": (239, 68, 68),
+}
+_TRAFFIC_LABELS = {"green": "畅通", "orange": "缓行", "red": "拥堵"}
+_TRAFFIC_UNKNOWN = (148, 163, 184)
+# 站点与车辆配色刻意避开路况的绿 / 橙 / 红，防止误读
+_TARGET_COLOR = (124, 58, 237)
+_BUS_COLOR = (37, 99, 235)
+_BUS_PASSED_COLOR = (100, 116, 139)
+_BUS_IDLE_COLOR = (148, 163, 184)
+_STATION_DOT_OUTLINE = (71, 85, 105)
 
 _FONT_CANDIDATES = (
     r"C:\Windows\Fonts\msyh.ttc",
@@ -193,7 +207,105 @@ def _text_center(
     draw.text((xy[0] - width / 2, xy[1] - size / 2), text, **kwargs)
 
 
+_BUS_BOX = 30
+_BUS_SCALE = 6
+_BUS_DISPLAY = 34
+
+
+def _mix(
+    color: tuple[int, int, int], other: tuple[int, int, int], ratio: float
+) -> tuple[int, int, int]:
+    """按 ratio 把 color 向 other 混色（0=全 color，1=全 other）。"""
+    return tuple(round(a + (b - a) * ratio) for a, b in zip(color, other))
+
+
+@lru_cache(maxsize=512)
+def _bus_icon(color: tuple[int, int, int], angle: int) -> Image.Image:
+    """渲染一枚「车头朝上」的俯视公交车图标，并按 angle 顺时针旋转。
+
+    俯视视角：车身用状态色，车顶是状态色偏白的浅色，前挡风与后窗是偏深的玻璃，
+    这样既有颜色标识又能一眼看出车头方向。先在 30 单位的设计稿上 6 倍超采样，
+    旋转后缩到 _BUS_DISPLAY 像素，保证旋转边缘不糊。
+
+    angle 为高德角度约定（0=正北，顺时针增大）。
+    """
+    s = _BUS_SCALE
+    size = _BUS_BOX * s
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    pen = ImageDraw.Draw(canvas)
+
+    roof = _mix(color, (255, 255, 255), 0.62)
+    glass = _mix(color, (16, 24, 40), 0.52)
+    # 车身（俯视），白色描边保证在深色底图上也清清楚楚
+    pen.rounded_rectangle(
+        [5 * s, 2 * s, 25 * s, 29 * s],
+        radius=5 * s,
+        fill=(*color, 255),
+        outline=(255, 255, 255, 255),
+        width=2 * s,
+    )
+    # 车顶（比车身浅，保留一点状态色）
+    pen.rounded_rectangle(
+        [8 * s, 7 * s, 22 * s, 25 * s],
+        radius=3 * s,
+        fill=(*roof, 255),
+    )
+    # 前挡风玻璃（车头朝上）
+    pen.rounded_rectangle(
+        [8 * s, 3 * s, 22 * s, 9 * s],
+        radius=2 * s,
+        fill=(*glass, 255),
+    )
+    # 后窗（比前挡风窄，用来区分车头车尾）
+    pen.rounded_rectangle(
+        [10 * s, 25 * s, 20 * s, 28 * s],
+        radius=1 * s,
+        fill=(*glass, 255),
+    )
+
+    if angle:
+        canvas = canvas.rotate(-angle, resample=Image.BICUBIC, expand=True)
+    ratio = _BUS_DISPLAY / _BUS_BOX
+    return canvas.resize(
+        (
+            max(1, round(canvas.width / s * ratio)),
+            max(1, round(canvas.height / s * ratio)),
+        ),
+        Image.LANCZOS,
+    )
+
+
+def _traffic_polyline(
+    points: list[tuple[float, float]],
+    indices: list[int],
+    traffic: list[dict],
+) -> list[tuple[str, list[tuple[float, float]]]] | None:
+    """按站间路况把折线切成 [(co, 点列), ...]；数据不可用时返回 None。
+
+    indices 是每个站点在 nihelist（即 points）中的下标，第 i 段
+    （站 i → 站 i+1）的路况取自 traffic[i]。co 为空串表示该段无路况数据。
+    """
+    if len(indices) < 2 or not traffic:
+        return None
+    if indices[0] < 0 or indices[-1] >= len(points):
+        return None
+    if any(b <= a for a, b in itertools.pairwise(indices)):
+        return None
+
+    used = min(len(indices) - 1, len(traffic))
+    chunks: list[tuple[str, list[tuple[float, float]]]] = []
+    if indices[0] > 0:
+        chunks.append(("", points[: indices[0] + 1]))
+    for i in range(used):
+        co = str((traffic[i] or {}).get("co") or "").strip().lower()
+        chunks.append((co, points[indices[i] : indices[i + 1] + 1]))
+    if indices[used] < len(points) - 1:
+        chunks.append(("", points[indices[used] :]))
+    return chunks or None
+
+
 def _draw_bus(
+    image: Image.Image,
     draw: ImageDraw.ImageDraw,
     font,
     x: float,
@@ -201,35 +313,62 @@ def _draw_bus(
     angle: float | None,
     label: str,
     color: tuple[int, int, int],
-    radius: int = 11,
 ) -> None:
-    """画一辆车：先画车头指向的三角，再压上有编号的圆。"""
+    """在地图上贴一辆公交车；有编号时在右上角补一个圆形徽章。"""
+    deg = 0
     if angle is not None and not math.isnan(angle):
-        rad = math.radians(angle)
-        dx, dy = math.sin(rad), -math.cos(rad)
-        tip = (x + dx * (radius + 11), y + dy * (radius + 11))
-        left = (
-            x - dy * (radius + 7) + dx * (radius - 5),
-            y + dx * (radius + 7) + dy * (radius - 5),
-        )
-        right = (
-            x + dy * (radius + 7) + dx * (radius - 5),
-            y - dx * (radius + 7) + dy * (radius - 5),
-        )
-        draw.polygon([tip, left, right], fill=color, outline=(255, 255, 255))
+        # 量化到 5°，减少图标缓存条目
+        deg = round(angle / 5.0) * 5 % 360
+    icon = _bus_icon(color, deg)
 
-    draw.ellipse(
-        [x - radius - 3, y - radius - 1, x + radius + 3, y + radius + 5],
-        fill=(0, 0, 0, 55),
-    )
-    draw.ellipse(
-        [x - radius, y - radius, x + radius, y + radius],
-        fill=color,
-        outline=(255, 255, 255),
-        width=2,
+    draw.ellipse([x - 12, y + 6, x + 12, y + 17], fill=(15, 23, 42, 45))
+    image.paste(
+        icon,
+        (round(x - icon.width / 2), round(y - icon.height / 2)),
+        icon,
     )
     if label:
-        _text_center(draw, (x, y), label, font, (255, 255, 255))
+        bx, by, radius = x + 13, y - 13, 9
+        draw.ellipse(
+            [bx - radius, by - radius, bx + radius, by + radius],
+            fill=color,
+            outline=(255, 255, 255),
+            width=2,
+        )
+        _text_center(draw, (bx, by), label, font, (255, 255, 255))
+
+
+def _draw_legend(
+    draw: ImageDraw.ImageDraw,
+    font,
+    items: list[tuple[tuple[int, int, int], str]],
+    height: int,
+) -> None:
+    """左下角图例。"""
+    if not items:
+        return
+    row_h = 20
+    text_w = max(draw.textlength(text, font=font) for _, text in items)
+    box_w = 44 + text_w
+    box_h = 12 + row_h * len(items)
+    x0 = 10
+    y0 = height - 10 - box_h
+    draw.rounded_rectangle(
+        [x0, y0, x0 + box_w, y0 + box_h],
+        radius=10,
+        fill=(255, 255, 255, 228),
+        outline=(198, 205, 216, 255),
+    )
+    for index, (color, text) in enumerate(items):
+        cy = y0 + 12 + row_h * index + row_h / 2
+        cx = x0 + 18
+        draw.ellipse(
+            [cx - 6, cy - 6, cx + 6, cy + 6],
+            fill=color,
+            outline=(255, 255, 255),
+            width=2,
+        )
+        draw.text((cx + 14, cy - 8), text, font=font, fill=(28, 32, 40))
 
 
 def _draw_header(
@@ -345,11 +484,27 @@ async def render_route_map(
     font_badge = _font(13)
     label_ok = _cjk_font(13) is not None
 
-    # 线路
+    # 线路：有路况数据就按段着色，否则整条单色
     points = [project(*item) for item in path]
+    traffic = result.get("traffic") or []
+    segments = None
+    if polyline and stations and traffic:
+        indices = [int(s.get("nihe_index", -1)) for s in stations]
+        segments = _traffic_polyline(points, indices, traffic)
     if len(points) > 1:
-        draw.line(points, fill=_ROUTE_CASING, width=9, joint="curve")
-        draw.line(points, fill=_ROUTE_COLOR, width=5, joint="curve")
+        draw.line(points, fill=_ROUTE_CASING, width=10, joint="curve")
+        if segments:
+            for co, chunk in segments:
+                if len(chunk) < 2:
+                    continue
+                draw.line(
+                    chunk,
+                    fill=_TRAFFIC_COLORS.get(co, _TRAFFIC_UNKNOWN),
+                    width=6,
+                    joint="curve",
+                )
+        else:
+            draw.line(points, fill=_ROUTE_COLOR, width=5, joint="curve")
 
     # 站点
     for station in stations:
@@ -363,7 +518,7 @@ async def render_route_map(
         draw.ellipse(
             [x - 3, y - 3, x + 3, y + 3],
             fill=(255, 255, 255),
-            outline=_ROUTE_COLOR,
+            outline=_STATION_DOT_OUTLINE,
             width=2,
         )
 
@@ -373,7 +528,7 @@ async def render_route_map(
     )
     if target and target.get("lng") and target.get("lat"):
         x, y = project(float(target["lng"]), float(target["lat"]))
-        draw.ellipse([x - 12, y - 12, x + 12, y + 12], fill=(8, 158, 82, 60))
+        draw.ellipse([x - 12, y - 12, x + 12, y + 12], fill=(124, 58, 237, 60))
         draw.ellipse(
             [x - 6, y - 6, x + 6, y + 6],
             fill=_TARGET_COLOR,
@@ -405,14 +560,38 @@ async def render_route_map(
         else:
             color = _BUS_IDLE_COLOR
             label = ""
-        _draw_bus(draw, font_badge, x, y, bus.get("angle"), label, color)
+        _draw_bus(image, draw, font_badge, x, y, bus.get("angle"), label, color)
 
     summary = f"在途 {len(buses)} 辆"
     if ranks:
-        summary += f" · 候选 {len(ranks)} 辆（红色）"
+        summary += f" · 候选 {len(ranks)} 辆（蓝）"
+    if segments:
+        counts: dict[str, int] = {}
+        for co, _ in segments:
+            if co in _TRAFFIC_LABELS:
+                counts[co] = counts.get(co, 0) + 1
+        parts = [
+            f"{_TRAFFIC_LABELS[co]}{counts[co]}"
+            for co in ("green", "orange", "red")
+            if counts.get(co)
+        ]
+        if parts:
+            summary += " · 路况 " + " / ".join(parts)
     if result.get("data_time"):
         summary += f" · 数据 {result['data_time']}"
     _draw_header(draw, title, summary, font_title, font_sub, width)
+
+    if label_ok:
+        legend: list[tuple[tuple[int, int, int], str]] = []
+        if segments:
+            legend.append((_TRAFFIC_COLORS["green"], "畅通"))
+            legend.append((_TRAFFIC_COLORS["orange"], "缓行"))
+            legend.append((_TRAFFIC_COLORS["red"], "拥堵"))
+        legend.append((_TARGET_COLOR, "候车站"))
+        if ranks:
+            legend.append((_BUS_COLOR, "候选车"))
+        legend.append((_BUS_IDLE_COLOR, "其他在途"))
+        _draw_legend(draw, font_sub, legend, height)
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=True)

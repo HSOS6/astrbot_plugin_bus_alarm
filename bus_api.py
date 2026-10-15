@@ -329,6 +329,8 @@ class BusClient:
                 "lat": _to_float(st.get("station_lat")),
                 "lng": _to_float(st.get("station_lon")),
                 "running": st.get("stationsStatus") == 1,
+                # 该站在 nihelist（道路拟合点）中的下标，画路况分段用；取不到为 -1
+                "nihe_index": int(_to_float(st.get("StationNihePointIndex"), -1)),
             }
             for st in (result.get("data") or [])
         ]
@@ -372,8 +374,10 @@ class BusClient:
     ) -> dict:
         """查询候车站最近 top_n 辆车的到站情况。
 
-        返回 {ok, reason, arrivals, buses, plan_time, data_time}
-        buses 是全部在途车辆的坐标与朝向（含已过候车站的车），画线路地图用。
+        返回 {ok, reason, arrivals, buses, traffic, plan_time, data_time}
+        buses 是全部在途车辆的坐标与朝向（含已过候车站的车），画线路地图用；
+        traffic 是站间路况 [{"co": green/orange/red, "speed": 米/分钟}, ...]，
+        第 i 段对应「站点 i → 站点 i+1」。
         """
         result = await self._fetch_realtime(line_name, direction, station_order, city)
         out: dict[str, Any] = {
@@ -397,6 +401,15 @@ class BusClient:
         dislist = result.get("dislist") or []
         speedlist = result.get("speedlist") or []
         buses = result.get("list") or []
+
+        # 站间路况（第 i 段 = 站点 i → 站点 i+1），画线路地图用
+        out["traffic"] = [
+            {
+                "co": str((seg or {}).get("co") or "").strip().lower(),
+                "speed": _to_float((seg or {}).get("speed")),
+            }
+            for seg in speedlist
+        ]
 
         arrivals: list[Arrival] = []
         for bus in buses:
