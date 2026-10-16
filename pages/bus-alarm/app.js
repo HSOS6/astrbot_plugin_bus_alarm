@@ -150,7 +150,10 @@ function renderAlarms() {
 
     const target = document.createElement("p");
     target.className = "alarm-meta";
-    target.textContent = `推送至 ${item.umo || "（未设置）"}`;
+    const owner = item.ownerName || item.ownerId || "";
+    target.textContent =
+      `推送至 ${item.umo || "（未设置）"}` +
+      (owner ? ` · 创建者 ${owner}` : " · 创建者（同会话共管）");
     card.appendChild(target);
 
     const actions = document.createElement("div");
@@ -231,6 +234,8 @@ function fillEditor(item) {
   $("#f-time").value = item.time;
   $("#f-topn").value = String(item.topN);
   $("#f-umo").value = item.umo;
+  $("#f-owner-id").value = item.ownerId || "";
+  $("#f-owner-name").value = item.ownerName || "";
 
   const presetValues = [...$("#f-repeat").options].map((option) => option.value);
   const preset = presetValues.includes(item.repeatRaw) && item.repeatRaw !== "custom";
@@ -254,6 +259,8 @@ function clearEditor() {
   $("#f-time").value = "07:30";
   $("#f-topn").value = "3";
   $("#f-umo").value = "";
+  $("#f-owner-id").value = "";
+  $("#f-owner-name").value = "";
   $("#route-card").hidden = true;
   text($("#editor-title"), "新建订阅");
   text($("#editor-msg"), "");
@@ -280,6 +287,8 @@ function formPayload() {
     time: $("#f-time").value,
     repeat: repeatValue(),
     top_n: $("#f-topn").value,
+    owner_id: $("#f-owner-id").value.trim(),
+    owner_name: $("#f-owner-name").value.trim(),
   };
 }
 

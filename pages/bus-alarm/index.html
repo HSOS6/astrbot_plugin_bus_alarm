@@ -104,6 +104,14 @@
               <small class="muted">填已存在的会话即可复用；也可直接粘贴 umo。</small>
               <datalist id="umo-list"></datalist>
             </label>
+            <label class="full">
+              创建者（可选）
+              <span class="row gap">
+                <input id="f-owner-id" placeholder="创建者 ID，例如 123456" />
+                <input id="f-owner-name" placeholder="创建者昵称，例如 小明" />
+              </span>
+              <small class="muted">留空表示「同会话的人都能管」；管理员可代填其他用户的 ID 来代建订阅。</small>
+            </label>
           </div>
           <div class="row gap mt">
             <button class="primary" id="btn-save">保存订阅</button>

@@ -358,6 +358,9 @@ class BusAlarmWebUI:
                     1, _as_int(payload.get("top_n"), self.plugin.default_top_n)
                 ),
                 "kind": "subscription",
+                # WebUI 由管理员使用，可代任意会话创建；留空表示「同会话的人都能管」
+                "owner_id": str(payload.get("owner_id") or "").strip(),
+                "owner_name": str(payload.get("owner_name") or "").strip(),
             }
         )
         logger.info(
@@ -376,6 +379,10 @@ class BusAlarmWebUI:
         try:
             if "enabled" in payload:
                 item["enabled"] = _as_bool(payload.get("enabled"))
+            if "owner_id" in payload:
+                item["owner_id"] = str(payload.get("owner_id") or "").strip()
+            if "owner_name" in payload:
+                item["owner_name"] = str(payload.get("owner_name") or "").strip()
             if payload.get("time"):
                 item["time"] = self.plugin.parse_time(str(payload["time"]))
             if payload.get("repeat"):
@@ -539,6 +546,8 @@ class BusAlarmWebUI:
             "stationOrder": _as_int(item.get("station_order")),
             "topN": _as_int(item.get("top_n"), plugin.default_top_n),
             "umo": str(item.get("umo") or ""),
+            "ownerId": str(item.get("owner_id") or ""),
+            "ownerName": str(item.get("owner_name") or ""),
             "lastFireDate": str(item.get("last_fire_date") or ""),
         }
 

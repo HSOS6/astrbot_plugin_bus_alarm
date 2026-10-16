@@ -135,6 +135,27 @@ def is_due_today(
     return True
 
 
+def can_manage(
+    item: dict | None, sender_id: str, *, is_admin: bool = False, umo: str = ""
+) -> bool:
+    """判断某个操作者能否查看 / 修改 / 删除这条订阅。
+
+    规则：
+      - 管理员（is_admin）可以管理所有人的订阅；
+      - 有创建者记录（owner_id）时，只有创建者本人能操作；
+      - 早期数据（本功能上线前创建）没有 owner_id，退回到「同会话可管理」，
+        否则升级后老订阅谁都动不了。
+    """
+    if is_admin:
+        return True
+    if not item:
+        return False
+    owner = str(item.get("owner_id") or "")
+    if owner:
+        return owner == str(sender_id or "")
+    return bool(umo) and item.get("umo") == umo
+
+
 class AlarmStore:
     """订阅的增删查改，JSON 文件持久化。"""
 

@@ -43,6 +43,7 @@ from .alarm_store import (
     CityStore,
     RepeatRuleError,
     _split_dates,
+    can_manage,
     describe_repeat,
     parse_repeat,
 )
@@ -75,9 +76,12 @@ HELP_TEXT = (
     "   ⤷ 时间 HH:MM · 重复规则 · 线路 · 方向 · 站序或站名 · 显示车辆数\n"
     "   ⤷ 重复规则可填：每天 / 工作日 / 非工作日 / 12345(周几，1=周一)\n"
     "——————————————\n"
-    "💬 也可以直接问，不用记指令：\n"
+    "💬 也可以直接说，不用记指令：\n"
     "   「我在市政府，1路到哪了」\n"
     "   ⤷ 没说方向时，会按你的通勤时段与出行习惯自动判断\n"
+    "   「每天早上7点半提醒我1路」→ 创建订阅\n"
+    "   「把2号改成8点」/「暂停1号」/「删掉3号」→ 改 / 停 / 删\n"
+    "   ⤷ 订阅归创建者，别人只能管自己建的，管理员不受限制\n"
     "——————————————\n"
     "/buslist         查看我的订阅\n"
     "/busdel  <编号>  删除订阅\n"
@@ -133,6 +137,8 @@ class BusAlarm(Star):
 
         # 自然语言查询与出行习惯学习
         self.nl_query = bool(self._cfg("nl_query", True))
+        # 自然语言「创建 / 修改 / 删除订阅」（与查询分开的开关）
+        self.nl_subscribe = bool(self._cfg("nl_subscribe", True))
         self.habit_enabled = bool(self._cfg("habit_enabled", True))
         self.habit_min_samples = max(1, int(self._cfg("habit_min_samples", 2) or 2))
         self.place_auto_learn = bool(self._cfg("place_auto_learn", True))
@@ -218,6 +224,60 @@ class BusAlarm(Star):
     def _city_for(self, event: AstrMessageEvent) -> str:
         """当前会话使用的城市（用户用 /buscity 设过就用它，否则用插件默认）。"""
         return self.cities.get(event.unified_msg_origin, self.client.default_city)
+
+    # ---------------- 订阅归属与权限 ----------------
+
+    @staticmethod
+    def _sender_identity(event: AstrMessageEvent) -> tuple[str, str]:
+        """取操作者的发送者 ID 与昵称，取不到就返回空串（老版本接口缺失时兜底）。"""
+        try:
+            sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            sender_id = ""
+        try:
+            sender_name = str(event.get_sender_name() or "")
+        except Exception:
+            sender_name = ""
+        return sender_id, sender_name
+
+    @staticmethod
+    def _is_admin(event: AstrMessageEvent) -> bool:
+        """判断操作者是否为 AstrBot 管理员（配置里手动添加的 ID）。"""
+        try:
+            return bool(event.is_admin())
+        except Exception:
+            return False
+
+    def _can_manage(self, event: AstrMessageEvent, item: dict | None) -> bool:
+        """这条订阅是否归当前操作者管（管理员无限制）。"""
+        sender_id, _ = self._sender_identity(event)
+        return can_manage(
+            item,
+            sender_id,
+            is_admin=self._is_admin(event),
+            umo=event.unified_msg_origin,
+        )
+
+    def _own_items(self, event: AstrMessageEvent, umo: str) -> list[dict]:
+        """当前操作者在本会话能管理的订阅（管理员返回该会话全部订阅）。"""
+        items = self.store.by_umo(umo)
+        if self._is_admin(event):
+            return items
+        sender_id, _ = self._sender_identity(event)
+        return [
+            item
+            for item in items
+            if can_manage(item, sender_id, umo=event.unified_msg_origin)
+        ]
+
+    @staticmethod
+    def _denied_text(sub_id: str, item: dict | None) -> str:
+        """越权操作时的提示。"""
+        owner = str(
+            (item or {}).get("owner_name") or (item or {}).get("owner_id") or ""
+        )
+        who = f"由 {owner} 创建" if owner else "不是你创建的"
+        return f"🚫 订阅 [{sub_id}] {who}，只有创建者或管理员可以操作"
 
     @staticmethod
     def parse_time(text: str) -> str:
@@ -676,6 +736,195 @@ class BusAlarm(Star):
             ):
                 yield chunk
 
+        @filter.llm_tool(name="bus_subscribe_add")
+        async def bus_subscribe_add_tool(
+            self,
+            event: AstrMessageEvent,
+            line_name: str,
+            time: str,
+            repeat: str,
+            station: str = "",
+            direction: str = "",
+            city: str = "",
+            top_n: str = "",
+        ):
+            """新建一条公交到站提醒（订阅）。
+
+            当用户想「提醒我 / 帮我订 / 加一个闹钟 / 以后到点叫我」时调用本工具。
+            时间与重复规则必须从用户原话里拿到；用户没说重复规则时默认传「每天」。
+            用户没提方向或候车站时**不要追问**，直接留空，本工具会按习惯推断并在回执里说明。
+
+            Args:
+                line_name(string): 公交线路名，例如 "1路"、"K2路"。必填。
+                time(string): 提醒时间，HH:MM 格式，例如 "07:30"。必填。
+                repeat(string): 重复规则，可填 "每天"、"工作日"、"非工作日" 或 "12345"
+                    （数字代表周几，1=周一）。用户没说就传 "每天"。
+                station(string): 候车站名或站序，例如 "市政府" 或 "12"。用户没说就传空字符串。
+                direction(string): 行驶方向，可填 "去程" 或 "回程"，也可以直接填终点站名。
+                    用户没有明确说方向时必须传空字符串，不要自己猜。
+                city(string): 城市名。用户没说就传空字符串，用当前会话的城市。
+                top_n(string): 到点推送几辆车，纯数字。用户没说就传空字符串。
+            """
+            if not self.nl_subscribe:
+                yield event.plain_result(
+                    "自然语言设置订阅已在插件配置里关闭，"
+                    "可以用 /busadd 添加，或 /bushelp 看用法"
+                )
+                return
+            item, error, notes = await self._build_subscription(
+                event,
+                line_name=line_name,
+                time_text=time,
+                repeat_text=repeat,
+                station=station,
+                direction=direction,
+                city=city,
+                top_n=top_n,
+            )
+            if item is None:
+                yield event.plain_result(f"⚠️ 没能建好这条订阅：{error}")
+                return
+            yield event.plain_result(self._sub_add_receipt(item, notes))
+
+        @filter.llm_tool(name="bus_subscribe_list")
+        async def bus_subscribe_list_tool(
+            self,
+            event: AstrMessageEvent,
+            scope: str = "",
+        ):
+            """查看公交到站提醒（订阅）列表。
+
+            当用户问「我订了哪些 / 有哪些提醒 / 看看我的订阅」时调用本工具。
+            默认只列出当前用户自己创建的订阅。
+
+            Args:
+                scope(string): 查看范围。留空或 "mine" 表示只列自己的；
+                    只有管理员可填 "all" 查看所有人的订阅。
+            """
+            if not self.nl_subscribe:
+                yield event.plain_result(
+                    "自然语言设置订阅已在插件配置里关闭，可以用 /buslist 查看"
+                )
+                return
+            want_all = str(scope or "").strip().lower() in ("all", "全部", "所有人")
+            if want_all and not self._is_admin(event):
+                yield event.plain_result("🚫 只有管理员可以查看所有人的订阅")
+                return
+            if want_all:
+                items = self.store.all()
+                title = f"🚌 全部会话共有 {len(items)} 条订阅"
+            else:
+                items = self._own_items(event, event.unified_msg_origin)
+                title = f"🚌 你在本会话有 {len(items)} 条订阅"
+            if not items:
+                yield event.plain_result(
+                    title + "（还没有，直接说「每天早上7点半提醒我1路」就能加）"
+                )
+                return
+            describer = self._describe_with_owner if want_all else self._describe
+            body = "\n".join(describer(item) for item in items)
+            yield event.plain_result(f"{title}：\n{body}")
+
+        @filter.llm_tool(name="bus_subscribe_update")
+        async def bus_subscribe_update_tool(
+            self,
+            event: AstrMessageEvent,
+            sub_id: str,
+            time: str = "",
+            repeat: str = "",
+            station: str = "",
+            direction: str = "",
+            line_name: str = "",
+            city: str = "",
+            top_n: str = "",
+            enabled: str = "",
+        ):
+            """修改一条已有的公交到站提醒（订阅），也可以用它启用 / 暂停。
+
+            当用户说「把 3 号改成 8 点 / 暂停 2 号 / 恢复 1 号 / 换成工作日」时调用本工具。
+            用户没提到的字段一律留空，不要臆造。
+
+            Args:
+                sub_id(string): 要修改的订阅编号，例如 "3"，也接受 "[3]"、"#3"。
+                time(string): 新的提醒时间 HH:MM。不改就传空字符串。
+                repeat(string): 新的重复规则（每天 / 工作日 / 非工作日 / 12345）。不改就传空字符串。
+                station(string): 新的候车站名或站序。不改就传空字符串。
+                direction(string): 新的方向（去程 / 回程 / 终点站名）。不改就传空字符串。
+                line_name(string): 新的线路名。不改就传空字符串。
+                city(string): 新的城市名。不改就传空字符串。
+                top_n(string): 新的显示车辆数。不改就传空字符串。
+                enabled(string): 启用就填 "启用"，暂停就填 "暂停"。不改就传空字符串。
+            """
+            if not self.nl_subscribe:
+                yield event.plain_result(
+                    "自然语言设置订阅已在插件配置里关闭，"
+                    "可以用 /buson、/busoff 或 /busdel，或 /bushelp 看用法"
+                )
+                return
+            clean = self._clean_id(sub_id)
+            item = self.store.get(clean) if clean else None
+            if item is None:
+                yield event.plain_result(f"没有找到编号为 {sub_id} 的订阅")
+                return
+            if not self._can_manage(event, item):
+                yield event.plain_result(self._denied_text(clean, item))
+                return
+
+            changed, error = await self._apply_subscription_edit(
+                event,
+                item,
+                time_text=time,
+                repeat_text=repeat,
+                station=station,
+                direction=direction,
+                line_name=line_name,
+                city=city,
+                top_n=top_n,
+                enabled=enabled,
+            )
+            if error:
+                yield event.plain_result(f"⚠️ 没能改这条订阅：{error}")
+                return
+            if not changed:
+                yield event.plain_result(
+                    f"没说要改什么，订阅 [{clean}] 保持原样：\n{self._describe(item)}"
+                )
+                return
+            body = "\n".join(f"· {line}" for line in changed)
+            yield event.plain_result(f"✏️ 已更新订阅 [{clean}]：\n{body}")
+
+        @filter.llm_tool(name="bus_subscribe_remove")
+        async def bus_subscribe_remove_tool(
+            self,
+            event: AstrMessageEvent,
+            sub_id: str,
+        ):
+            """删除一条公交到站提醒（订阅）。
+
+            当用户说「取消 / 删掉 / 不要了」某个订阅时调用本工具。
+
+            Args:
+                sub_id(string): 要删除的订阅编号，例如 "3"，也接受 "[3]"、"#3"。
+            """
+            if not self.nl_subscribe:
+                yield event.plain_result(
+                    "自然语言设置订阅已在插件配置里关闭，可以用 /busdel 删除"
+                )
+                return
+            clean = self._clean_id(sub_id)
+            item = self.store.get(clean) if clean else None
+            if item is None:
+                yield event.plain_result(f"没有找到编号为 {sub_id} 的订阅")
+                return
+            if not self._can_manage(event, item):
+                yield event.plain_result(self._denied_text(clean, item))
+                return
+            self.store.remove(clean)
+            yield event.plain_result(
+                f"🗑 已删除订阅 [{clean}] {item.get('line_name')}"
+                f" · {item.get('station_name')}"
+            )
+
     async def build_map_image(
         self,
         line_name: str,
@@ -751,6 +1000,350 @@ class BusAlarm(Star):
             f"     [{city}] {item.get('line_name')}（{target}）· 候车：{item.get('station_name')}"
             f" · 显示 {item.get('top_n', DEFAULT_TOP_N)} 辆"
         )
+
+    # ---------------- 自然语言订阅管理：公共逻辑 ----------------
+
+    @staticmethod
+    def _clean_id(text: Any) -> str:
+        """把「[3]」「#3」这类写法统一成纯数字编号。"""
+        return "".join(ch for ch in str(text or "") if ch.isdigit())
+
+    @staticmethod
+    def _enabled_value(text: Any) -> bool | None:
+        """把「启用 / 暂停 / true / false」解析成布尔值；无法识别返回 None。"""
+        token = str(text or "").strip().lower()
+        if not token or token == "none":
+            return None
+        if token in ("1", "true", "yes", "on", "启用", "开启", "打开", "恢复", "开始"):
+            return True
+        if token in ("0", "false", "no", "off", "暂停", "关闭", "停用", "停", "关"):
+            return False
+        return None
+
+    async def _city_token(self, value: Any, fallback: str) -> str:
+        """校验城市名（允许只写「福州」并自动补「市」），校验不了就原样返回。"""
+        token = str(value or "").strip()
+        if not token:
+            return fallback
+        exists = getattr(self.client, "city_exists", None)
+        if exists is None:
+            return token
+        candidates = [token] + ([] if token.endswith("市") else [token + "市"])
+        for candidate in candidates:
+            try:
+                if await exists(candidate):
+                    return candidate
+            except BusApiError:
+                break
+        return token
+
+    def _find_duplicate(
+        self,
+        umo: str,
+        line_name: str,
+        direction: int,
+        station_name: str,
+        fire_time: str,
+    ) -> dict | None:
+        """查找完全重复的订阅（同会话 · 同线路 · 同方向 · 同站点 · 同时间）。"""
+        for item in self.store.by_umo(umo):
+            if (
+                item.get("line_name") == line_name
+                and int(item.get("direction") or 0) == int(direction)
+                and item.get("time") == fire_time
+                and self._same_station(
+                    str(item.get("station_name") or ""), station_name
+                )
+            ):
+                return item
+        return None
+
+    async def _build_subscription(
+        self,
+        event: AstrMessageEvent,
+        *,
+        line_name: str,
+        time_text: str,
+        repeat_text: str,
+        station: str = "",
+        direction: str = "",
+        city: str = "",
+        top_n: Any = "",
+    ) -> tuple[dict | None, str, list[str]]:
+        """把 AI 提取的参数整理成一条订阅。
+
+        返回（订阅项, 错误说明, 推断提示）。订阅项为 None 时以错误说明为准；
+        推断提示用于在回执里点名「哪些是我替你猜的」。
+        """
+        umo = event.unified_msg_origin
+        notes: list[str] = []
+
+        try:
+            fire_time = self.parse_time(time_text)
+        except ValueError as exc:
+            return None, str(exc), notes
+        try:
+            repeat = parse_repeat(repeat_text)
+        except RepeatRuleError as exc:
+            return None, str(exc), notes
+
+        line_token = (line_name or "").strip()
+        if not line_token:
+            return None, "要订阅哪条线路呢？例如「1路」", notes
+
+        city_now = await self._city_token(city, self._city_for(event))
+        try:
+            lines = await self.client.search_lines(line_token, city=city_now)
+        except BusApiError as exc:
+            return None, f"查询线路失败：{exc}", notes
+
+        exact = [line for line in lines if line["line_name"] == line_token]
+        if not exact and len(lines) == 1:
+            exact = lines
+        if not exact:
+            if not lines:
+                return (
+                    None,
+                    (
+                        f"在「{city_now}」没找到包含「{line_token}」的线路，"
+                        "城市不对可以先用 /buscity 切换"
+                    ),
+                    notes,
+                )
+            body = "\n".join(
+                f"· {line['line_name']}（方向{line['direction']}）"
+                f"{line['from']} → {line['to']}"
+                for line in lines[:10]
+            )
+            return (
+                None,
+                (f"「{line_token}」匹配到多条线路，请告诉我完整线路名：\n{body}"),
+                notes,
+            )
+
+        line_token = exact[0]["line_name"]
+        available = sorted({int(line["direction"]) for line in exact})
+        now = dt.datetime.now()
+
+        want = self._direction_from_text(direction, exact)
+        if want in available:
+            direction_now = want
+        elif len(available) == 1:
+            direction_now = available[0]
+        else:
+            inferred = await self._infer_direction(
+                umo, line_token, city_now, station, available, now
+            )
+            if inferred is None:
+                return (
+                    None,
+                    (
+                        f"「{line_token}」有 {'、'.join(str(d) for d in available)} "
+                        "两个方向，你没说走哪个（可以填「去程」「回程」或终点站名），"
+                        "我也没从你的习惯里判断出来"
+                    ),
+                    notes,
+                )
+            direction_now = int(inferred[0])
+            notes.append("方向：" + str(inferred[1]))
+
+        kind = day_kind_of(now, self.holidays, self.workdays)
+        provided = (station or "").strip()
+        station_token = provided or self._station_hint(
+            umo, line_token, direction_now, "", now, kind
+        )
+        if not station_token:
+            return (
+                None,
+                "要在哪个站候车呢？说个站名或站序（例如「市政府」或「12」）",
+                notes,
+            )
+        if not provided:
+            notes.append(f"候车站：{station_token}")
+
+        try:
+            resolved = await self.resolve_station(
+                line_token, direction_now, station_token, city_now
+            )
+        except BusApiError as exc:
+            return None, f"查询线路失败：{exc}", notes
+        except ValueError as exc:
+            return None, str(exc), notes
+
+        dup = self._find_duplicate(
+            umo, line_token, direction_now, resolved["station_name"], fire_time
+        )
+        if dup is not None:
+            return (
+                None,
+                (
+                    f"你已经有一条一样的订阅了：[{dup['id']}] {dup['time']} "
+                    f"{line_token} · 候车 {resolved['station_name']}"
+                ),
+                notes,
+            )
+
+        top = self.default_top_n
+        if str(top_n or "").strip():
+            try:
+                top = max(1, int(str(top_n).strip()))
+            except ValueError:
+                top = self.default_top_n
+
+        owner_id, owner_name = self._sender_identity(event)
+        route = resolved["route"]
+        item = self.store.add(
+            {
+                "umo": umo,
+                "time": fire_time,
+                "repeat": repeat,
+                "city": city_now,
+                "line_name": line_token,
+                "direction": direction_now,
+                "direction_to": route["to_station"],
+                "station_order": resolved["station_order"],
+                "station_name": resolved["station_name"],
+                "top_n": top,
+                "kind": "subscription",
+                "owner_id": owner_id,
+                "owner_name": owner_name,
+            }
+        )
+        self._record_observation(
+            umo,
+            line=line_token,
+            direction=direction_now,
+            station=str(resolved["station_name"]),
+            city=city_now,
+            source="explicit",
+            now=now,
+        )
+        return item, "", notes
+
+    def _sub_add_receipt(self, item: dict, notes: list[str]) -> str:
+        """新增订阅的回执；notes 非空时点名推断项。"""
+        text = (
+            f"✅ 已订阅 [{item['id']}]\n"
+            f"⏰ {item['time']} · {describe_repeat(item.get('repeat'))}\n"
+            f"🚏 [{item['city']}] {item['line_name']}"
+            f"（往 {item.get('direction_to') or '未知'}）"
+            f"· 候车：{item['station_name']}（第 {item.get('station_order')} 站）\n"
+            f"📊 到点会推送最近的 {item.get('top_n')} 辆车"
+        )
+        if notes:
+            text += "\n\n🤔 这些是我替你判断的，不对直接说，我帮你改：\n" + "\n".join(
+                f"· {note}" for note in notes
+            )
+        return text
+
+    def _describe_with_owner(self, item: dict) -> str:
+        """在订阅描述后补一行创建者与会话（给管理员看全部订阅时用）。"""
+        owner = str(item.get("owner_name") or item.get("owner_id") or "").strip()
+        return (
+            f"{self._describe(item)}\n"
+            f"     👤 创建者：{owner or '（未记录）'} · 会话：{item.get('umo')}"
+        )
+
+    async def _apply_subscription_edit(
+        self,
+        event: AstrMessageEvent,
+        item: dict,
+        *,
+        time_text: str = "",
+        repeat_text: str = "",
+        station: str = "",
+        direction: str = "",
+        line_name: str = "",
+        city: str = "",
+        top_n: Any = "",
+        enabled: Any = "",
+    ) -> tuple[list[str], str]:
+        """把 AI 给出的字段应用到订阅上，返回（变更说明, 错误信息）。"""
+        changed: list[str] = []
+
+        if str(time_text or "").strip():
+            try:
+                item["time"] = self.parse_time(time_text)
+            except ValueError as exc:
+                return changed, str(exc)
+            changed.append(f"提醒时间 → {item['time']}")
+
+        if str(repeat_text or "").strip():
+            try:
+                item["repeat"] = parse_repeat(repeat_text)
+            except RepeatRuleError as exc:
+                return changed, str(exc)
+            changed.append(f"重复规则 → {describe_repeat(item['repeat'])}")
+
+        if str(enabled or "").strip():
+            value = self._enabled_value(enabled)
+            if value is None:
+                return changed, "启用状态只认「启用」或「暂停」"
+            item["enabled"] = value
+            changed.append("状态 → 已启用" if value else "状态 → 已暂停")
+
+        if str(top_n or "").strip():
+            try:
+                item["top_n"] = max(1, int(str(top_n).strip()))
+            except ValueError:
+                return changed, "显示车辆数要填数字"
+            changed.append(f"显示车辆数 → {item['top_n']}")
+
+        wants_route = any(
+            str(value or "").strip() for value in (city, line_name, station, direction)
+        )
+        if wants_route:
+            try:
+                city_now = await self._city_token(
+                    city, str(item.get("city") or self._city_for(event))
+                )
+                new_line = (line_name or item.get("line_name") or "").strip()
+                lines = await self.client.search_lines(new_line, city=city_now)
+                exact = [line for line in lines if line["line_name"] == new_line]
+                if not exact and len(lines) == 1:
+                    exact = lines
+                current_dir = int(item.get("direction") or 1)
+                available = sorted({int(line["direction"]) for line in exact}) or [
+                    current_dir
+                ]
+                want = self._direction_from_text(direction, exact) if direction else 0
+                if want in available:
+                    new_dir = want
+                elif str(direction or "").strip():
+                    return changed, (
+                        f"「{new_line}」没有这个方向，可选："
+                        + "、".join(str(d) for d in available)
+                    )
+                else:
+                    new_dir = current_dir if current_dir in available else available[0]
+                new_station = (station or item.get("station_name") or "").strip()
+                resolved = await self.resolve_station(
+                    new_line, new_dir, new_station, city_now
+                )
+            except BusApiError as exc:
+                return changed, f"查询线路失败：{exc}"
+            except ValueError as exc:
+                return changed, str(exc)
+
+            route = resolved["route"]
+            item.update(
+                {
+                    "city": city_now,
+                    "line_name": route["line_name"],
+                    "direction": new_dir,
+                    "direction_to": route["to_station"],
+                    "station_order": resolved["station_order"],
+                    "station_name": resolved["station_name"],
+                }
+            )
+            changed.append(
+                f"线路 / 站点 → [{city_now}] {route['line_name']}"
+                f"（往 {route['to_station']}）· 候车 {resolved['station_name']}"
+            )
+
+        if changed:
+            self.store.save()
+        return changed, ""
 
     # ---------------- 指令 ----------------
 
@@ -938,6 +1531,7 @@ class BusAlarm(Star):
             return
 
         route = resolved["route"]
+        owner_id, owner_name = self._sender_identity(event)
         item = self.store.add(
             {
                 "umo": event.unified_msg_origin,
@@ -951,6 +1545,8 @@ class BusAlarm(Star):
                 "station_name": resolved["station_name"],
                 "top_n": top_n if top_n > 0 else self.default_top_n,
                 "kind": "subscription",
+                "owner_id": owner_id,
+                "owner_name": owner_name,
             }
         )
 
@@ -1019,6 +1615,9 @@ class BusAlarm(Star):
         if item is None or item.get("umo") != event.unified_msg_origin:
             yield event.plain_result(f"没有找到编号为 {sub_id} 的订阅")
             return
+        if not self._can_manage(event, item):
+            yield event.plain_result(self._denied_text(sub_id, item))
+            return
         self.store.remove(sub_id)
         yield event.plain_result(
             f"🗑 已删除订阅 [{sub_id}] {item.get('line_name')} · {item.get('station_name')}"
@@ -1031,6 +1630,9 @@ class BusAlarm(Star):
         if item is None or item.get("umo") != event.unified_msg_origin:
             yield event.plain_result(f"没有找到编号为 {sub_id} 的订阅")
             return
+        if not self._can_manage(event, item):
+            yield event.plain_result(self._denied_text(sub_id, item))
+            return
         if not item.get("enabled", True):
             self.store.toggle(sub_id)
         yield event.plain_result(f"✅ 订阅 [{sub_id}] 已启用")
@@ -1041,6 +1643,9 @@ class BusAlarm(Star):
         item = self.store.get(sub_id)
         if item is None or item.get("umo") != event.unified_msg_origin:
             yield event.plain_result(f"没有找到编号为 {sub_id} 的订阅")
+            return
+        if not self._can_manage(event, item):
+            yield event.plain_result(self._denied_text(sub_id, item))
             return
         if item.get("enabled", True):
             self.store.toggle(sub_id)
