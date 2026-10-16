@@ -22,6 +22,48 @@
     "default": true,
     "hint": "开启后，到点推送会额外发一张「线路走向 + 车辆位置」的图片（底图来自高德公开瓦片，无需 key）。取不到瓦片时会自动降级为只有线路与车辆的简图。"
   },
+  "nl_query": {
+    "description": "开启自然语言查询",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后可以直接对机器人说「我在市政府，1路到哪了」，由 AI 提取线路与站点并作答，无需记住指令。关闭后只保留 /busnow 等指令。"
+  },
+  "habit_enabled": {
+    "description": "学习用户出行习惯",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会记录每次查询的线路 / 方向 / 站点与时间，用于在用户没说明方向时自动推断。数据仅保存在本地 data 目录，可用 /bushabit 查看、清除。"
+  },
+  "place_auto_learn": {
+    "description": "自动识别家 / 公司站点",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会根据工作日通勤时段的出行记录，自动推断「家」与「公司」常驻站点，用于判断方向。可用 /busplace 手动修正。"
+  },
+  "habit_retention_days": {
+    "description": "出行记录保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "超过这个天数的出行记录会被自动清理，避免旧习惯长期影响推断。"
+  },
+  "habit_min_samples": {
+    "description": "推断所需最少样本数",
+    "type": "int",
+    "default": 2,
+    "hint": "同一时段至少积累这么多次同方向出行，才用它来推断方向。样本太少时不会强行猜，改为双向都查。"
+  },
+  "commute_am": {
+    "description": "早通勤时段",
+    "type": "string",
+    "default": "07:00-09:00",
+    "hint": "格式 07:00-09:00。处于该时段且已知家 / 公司站点时，会优先按「家 → 公司」方向推断。"
+  },
+  "commute_pm": {
+    "description": "晚通勤时段",
+    "type": "string",
+    "default": "17:00-19:00",
+    "hint": "格式 17:00-19:00。处于该时段且已知家 / 公司站点时，会优先按「公司 → 家」方向推断。"
+  },
   "holiday_api": {
     "description": "自动获取在线节假日数据",
     "type": "bool",

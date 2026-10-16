@@ -48,6 +48,14 @@ from .alarm_store import (
 )
 from .bus_api import DEFAULT_CITY, BusApiError, BusClient, render_arrivals
 from .holiday_api import HolidayCalendar
+from .profile import (
+    ProfileStore,
+    bucket_label,
+    bucket_of,
+    day_kind_of,
+    in_window,
+    parse_window,
+)
 from .scheduler import AlarmScheduler
 from .webui import BusAlarmWebUI
 
@@ -67,12 +75,19 @@ HELP_TEXT = (
     "   ⤷ 时间 HH:MM · 重复规则 · 线路 · 方向 · 站序或站名 · 显示车辆数\n"
     "   ⤷ 重复规则可填：每天 / 工作日 / 非工作日 / 12345(周几，1=周一)\n"
     "——————————————\n"
+    "💬 也可以直接问，不用记指令：\n"
+    "   「我在市政府，1路到哪了」\n"
+    "   ⤷ 没说方向时，会按你的通勤时段与出行习惯自动判断\n"
+    "——————————————\n"
     "/buslist         查看我的订阅\n"
     "/busdel  <编号>  删除订阅\n"
     "/buson   <编号>  启用订阅\n"
     "/busoff  <编号>  暂停订阅\n"
     "/busnow  <编号>  立即查询一次\n"
     "/buscalendar     查看节假日 / 补班日数据\n"
+    "——————————————\n"
+    "/bushabit        查看学到的出行习惯\n"
+    "/busplace        设置家 / 公司的站点（帮助推断方向）\n"
     "——————————————\n"
     "也可以在 AstrBot WebUI 的插件页面里图形化管理订阅"
 )
@@ -115,6 +130,22 @@ class BusAlarm(Star):
         )
         # 推送时是否附带「线路走向 + 车辆位置」地图
         self.map_in_push = bool(self._cfg("map_in_push", True))
+
+        # 自然语言查询与出行习惯学习
+        self.nl_query = bool(self._cfg("nl_query", True))
+        self.habit_enabled = bool(self._cfg("habit_enabled", True))
+        self.habit_min_samples = max(1, int(self._cfg("habit_min_samples", 2) or 2))
+        self.place_auto_learn = bool(self._cfg("place_auto_learn", True))
+        self.commute_am = parse_window(
+            self._cfg("commute_am", "07:00-09:00"), (7 * 60, 9 * 60)
+        )
+        self.commute_pm = parse_window(
+            self._cfg("commute_pm", "17:00-19:00"), (17 * 60, 19 * 60)
+        )
+        self.profile = ProfileStore(
+            data_dir,
+            retention_days=int(self._cfg("habit_retention_days", 30) or 30),
+        )
 
         # Dashboard 插件页面的后端接口（页面在 pages/bus-alarm/ 下）
         self.webui = BusAlarmWebUI(self, PLUGIN_NAME)
@@ -240,6 +271,410 @@ class BusAlarm(Star):
         raise ValueError(
             f"在 {line_name} 方向{direction} 里没找到「{token}」。前几站：{candidates}"
         )
+
+    # ---------------- 自然语言查询：方向推断 ----------------
+
+    @staticmethod
+    def _same_station(left: str, right: str) -> bool:
+        """站名比较（含前后缀差异，如「市政府」与「市政府站」）。"""
+        a, b = (left or "").strip(), (right or "").strip()
+        if not a or not b:
+            return False
+        return a == b or a in b or b in a
+
+    @staticmethod
+    def _match_order(stations: list[dict], name: str) -> int | None:
+        """在线路站点表里定位一个站名（精确优先，其次包含）。"""
+        token = (name or "").strip()
+        if not token:
+            return None
+        for station in stations:
+            if station["name"] == token:
+                return int(station["order"])
+        for station in stations:
+            if token in station["name"] or station["name"] in token:
+                return int(station["order"])
+        return None
+
+    @staticmethod
+    def _direction_from_text(text: str, entries: list[dict]) -> int:
+        """把 AI 提取的方向文本解析成 1 / 2；无法确定返回 0。"""
+        token = (text or "").strip()
+        if not token:
+            return 0
+        lowered = token.lower()
+        if lowered in ("1", "上行", "去程", "去", "往程", "up", "outbound"):
+            return 1
+        if lowered in ("2", "下行", "回程", "回", "返程", "down", "inbound"):
+            return 2
+        # 用户说的是终点站名，比如「往火车站方向」
+        for entry in entries or []:
+            terminal = str(entry.get("to") or "")
+            if terminal and (terminal in token or token in terminal):
+                return int(entry["direction"])
+        return 0
+
+    async def _direction_between(
+        self,
+        line_name: str,
+        city: str,
+        origin: str,
+        dest: str,
+        available: list[int],
+    ) -> int | None:
+        """找出「先经过 origin 再经过 dest」的那个方向（跨线路通用）。"""
+        for direction in available:
+            try:
+                route = await self.client.get_route(line_name, direction, city=city)
+            except BusApiError:
+                continue
+            start = self._match_order(route["stations"], origin)
+            end = self._match_order(route["stations"], dest)
+            if start is not None and end is not None and start < end:
+                return direction
+        return None
+
+    def _commute_intent(
+        self, umo: str, station: str, now: dt.datetime
+    ) -> tuple[str, str] | None:
+        """判断用户此刻是否在「家 ↔ 公司」的通勤路上，返回（起点站, 终点站）。"""
+        places = self.profile.places(umo)
+        home = str((places.get("home") or {}).get("name") or "")
+        work = str((places.get("work") or {}).get("name") or "")
+        if not (home and work):
+            return None
+
+        minutes = now.hour * 60 + now.minute
+        token = (station or "").strip()
+        if token:
+            if self._same_station(token, home) and in_window(minutes, self.commute_am):
+                return home, work
+            if self._same_station(token, work) and in_window(minutes, self.commute_pm):
+                return work, home
+            return None
+        # 用户没说站点时，按时段猜：早上多半从家走，傍晚多半从公司走
+        if in_window(minutes, self.commute_am):
+            return home, work
+        if in_window(minutes, self.commute_pm):
+            return work, home
+        return None
+
+    async def _infer_direction(
+        self,
+        umo: str,
+        line_name: str,
+        city: str,
+        station: str,
+        available: list[int],
+        now: dt.datetime,
+    ) -> tuple[int, str] | None:
+        """用户没说方向时的推断链：地点语义 → 时段习惯。"""
+        # ① 地点语义 + 通勤时段
+        intent = self._commute_intent(umo, station, now)
+        if intent:
+            origin, dest = intent
+            found = await self._direction_between(
+                line_name, city, origin, dest, available
+            )
+            if found in available:
+                return found, f"通勤时段，按你平时从「{origin}」到「{dest}」的方向推的"
+
+        # ② 同时段的出行习惯
+        if self.habit_enabled:
+            kind = day_kind_of(now, self.holidays, self.workdays)
+            ticket = self.profile.predict(
+                umo,
+                now,
+                kind,
+                line=line_name,
+                station=station,
+                min_samples=self.habit_min_samples,
+            )
+            if ticket and int(ticket["direction"]) in available:
+                return (
+                    int(ticket["direction"]),
+                    f"按你平时 {bucket_label(bucket_of(now))} 前后坐这趟车的习惯推的",
+                )
+        return None
+
+    def _station_hint(
+        self,
+        umo: str,
+        line_name: str,
+        direction: int,
+        station: str,
+        now: dt.datetime,
+        kind: str,
+    ) -> str:
+        """用户没说站名时，依次从通勤地点 / 出行习惯 / 已有订阅里找候车站。"""
+        token = (station or "").strip()
+        if token:
+            return token
+
+        intent = self._commute_intent(umo, "", now)
+        if intent:
+            return intent[0]
+
+        ticket = self.profile.predict(umo, now, kind, line=line_name, min_samples=1)
+        if ticket and ticket.get("station"):
+            return str(ticket["station"])
+
+        for item in self.store.by_umo(umo):
+            if (
+                item.get("line_name") == line_name
+                and int(item.get("direction") or 0) == direction
+            ):
+                return str(item.get("station_name") or "")
+        return ""
+
+    @staticmethod
+    def _best_eta(result: dict) -> float | None:
+        """这一侧最近一辆车还有多久到（分钟）；没有车返回 None。"""
+        best: float | None = None
+        for arrival in result.get("arrivals") or []:
+            value = 0.0 if arrival.stops_away <= 0 else arrival.eta_minutes
+            best = value if best is None else min(best, value)
+        return best
+
+    async def _query_plan(
+        self,
+        umo: str,
+        line_name: str,
+        city: str,
+        station: str,
+        plan: list[tuple[int, str]],
+        now: dt.datetime,
+    ) -> tuple[list[dict], list[str]]:
+        """按计划里的方向逐个查询，返回（成功项, 错误说明）。"""
+        kind = day_kind_of(now, self.holidays, self.workdays)
+        items: list[dict] = []
+        errors: list[str] = []
+        for direction, reason in plan:
+            station_token = self._station_hint(
+                umo, line_name, direction, station, now, kind
+            )
+            if not station_token:
+                errors.append("不知道你要在哪个站候车")
+                continue
+            try:
+                resolved = await self.resolve_station(
+                    line_name, direction, station_token, city
+                )
+                result = await self.client.query(
+                    line_name,
+                    direction,
+                    resolved["station_order"],
+                    self.default_top_n,
+                    city=city,
+                )
+            except BusApiError as exc:
+                errors.append(f"方向{direction}查询失败：{exc}")
+                continue
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            items.append(
+                {
+                    "direction": direction,
+                    "reason": reason,
+                    "resolved": resolved,
+                    "result": result,
+                }
+            )
+        return items, errors
+
+    def _record_observation(
+        self,
+        umo: str,
+        *,
+        line: str,
+        direction: int,
+        station: str,
+        city: str,
+        source: str,
+        now: dt.datetime,
+    ) -> None:
+        """把这次查询记进画像，并按需认家 / 认公司。"""
+        if not self.habit_enabled:
+            return
+        self.profile.remember(
+            umo,
+            line=line,
+            direction=direction,
+            station=station,
+            city=city,
+            source=source,
+            weight=1.0 if source == "explicit" else 0.3,
+            when=now,
+        )
+        if self.place_auto_learn:
+            self.profile.learn_places(umo, min_hits=self.habit_min_samples)
+
+    async def _answer_arrival(
+        self,
+        event: AstrMessageEvent,
+        line_name: str,
+        station: str = "",
+        direction: str = "",
+        city: str = "",
+    ):
+        """自然语言查询主流程：认线路 → 定方向 → 解析候车站 → 输出到站信息。"""
+        umo = event.unified_msg_origin
+        line_token = (line_name or "").strip()
+        if not line_token:
+            yield event.plain_result(
+                "要查哪条线路呢？比如「1路到哪了」，或用 /bushelp 看完整用法"
+            )
+            return
+
+        city_now = (city or "").strip() or self._city_for(event)
+        try:
+            lines = await self.client.search_lines(line_token, city=city_now)
+        except BusApiError as exc:
+            yield event.plain_result(f"查询失败：{exc}")
+            return
+
+        exact = [line for line in lines if line["line_name"] == line_token]
+        if not exact and len(lines) == 1:
+            exact = lines
+            line_token = lines[0]["line_name"]
+        if not exact:
+            if not lines:
+                yield event.plain_result(
+                    f"在「{city_now}」没找到包含「{line_token}」的线路，"
+                    "城市不对可以先用 /buscity 切换"
+                )
+                return
+            body = "\n".join(
+                f"· {line['line_name']}（方向{line['direction']}）"
+                f"{line['from']} → {line['to']}"
+                for line in lines[:10]
+            )
+            yield event.plain_result(
+                f"「{line_token}」匹配到多条线路，用完整线路名再问一次：\n{body}"
+            )
+            return
+
+        available = sorted({int(line["direction"]) for line in exact})
+        now = dt.datetime.now()
+
+        want = self._direction_from_text(direction, exact)
+        if want in available:
+            plan: list[tuple[int, str]] = [(want, "按你指定的方向查")]
+            source = "explicit"
+        else:
+            inferred = await self._infer_direction(
+                umo, line_token, city_now, station, available, now
+            )
+            if inferred:
+                plan = [inferred]
+                source = "inferred"
+            else:
+                plan = [
+                    (item, "你没说方向，两个方向都查了，下面是有车的那边")
+                    for item in available
+                ]
+                source = "inferred"
+
+        items, errors = await self._query_plan(
+            umo, line_token, city_now, station, plan, now
+        )
+        if not items:
+            text = "这次没查到候车信息。"
+            if errors:
+                text += "\n" + "\n".join(dict.fromkeys(errors))
+            text += "\n把站名一起告诉我就能查，例如「1路 市政府 到哪了」"
+            yield event.plain_result(text)
+            return
+
+        chosen = items
+        if len(items) > 1:
+            scored = [(self._best_eta(item["result"]), item) for item in items]
+            with_bus = sorted(
+                (pair for pair in scored if pair[0] is not None),
+                key=lambda pair: pair[0],
+            )
+            if len(with_bus) == 1 or (
+                len(with_bus) >= 2 and with_bus[1][0] - with_bus[0][0] >= 3
+            ):
+                chosen = [with_bus[0][1]]
+
+        for item in chosen:
+            resolved = item["resolved"]
+            result = item["result"]
+            route = resolved["route"]
+            terminal = route.get("to_station") or ""
+            text = render_arrivals(
+                line_token,
+                terminal,
+                resolved["station_name"],
+                result,
+                city=city_now,
+            )
+            if source == "inferred":
+                text += f"\n🤔 {item['reason']}"
+            chain = event.make_result().message(text)
+            chain = await self.attach_map(
+                chain,
+                line_name=line_token,
+                direction=item["direction"],
+                station_order=resolved["station_order"],
+                station_name=resolved["station_name"],
+                direction_to=terminal,
+                city=city_now,
+                result=result,
+                route=route,
+            )
+            yield chain
+
+        if len(chosen) == 1:
+            item = chosen[0]
+            self._record_observation(
+                umo,
+                line=line_token,
+                direction=int(item["direction"]),
+                station=str(item["resolved"]["station_name"]),
+                city=city_now,
+                source=source,
+                now=now,
+            )
+
+    # ---------------- 自然语言查询：LLM 函数工具 ----------------
+
+    if hasattr(filter, "llm_tool"):
+
+        @filter.llm_tool(name="bus_arrival")
+        async def bus_arrival_tool(
+            self,
+            event: AstrMessageEvent,
+            line_name: str,
+            station: str = "",
+            direction: str = "",
+            city: str = "",
+        ):
+            """查询公交车的实时到站情况。
+
+            当用户问某条公交线路「到哪了 / 还有几站 / 什么时候来 / 帮我查一下」时调用本工具。
+            用户没提方向或候车站时**不要追问**，直接留空，本工具会按用户的历史习惯、
+            通勤时段与当前位置自动推断。
+
+            Args:
+                line_name(string): 公交线路名，例如 "1路"、"K2路"。必填，从用户原话里提取。
+                station(string): 候车站名或站序，例如 "市政府"。用户没说就传空字符串。
+                direction(string): 行驶方向，可填 "去程" 或 "回程"，也可以直接填终点站名。
+                    用户没有明确说方向时必须传空字符串，不要自己猜。
+                city(string): 城市名。用户没说就传空字符串，本工具会用当前会话的城市。
+            """
+            if not self.nl_query:
+                yield event.plain_result(
+                    "自然语言查询已在插件配置里关闭，"
+                    "可以用 /busnow <编号> 查订阅，或 /bushelp 看用法"
+                )
+                return
+            async for chunk in self._answer_arrival(
+                event, line_name, station, direction, city
+            ):
+                yield chunk
 
     async def build_map_image(
         self,
@@ -652,6 +1087,112 @@ class BusAlarm(Star):
             result=result,
         )
         yield chain
+
+    @filter.command("bushabit")
+    async def bushabit(self, event: AstrMessageEvent, action: str = ""):
+        """查看插件学到的出行习惯。用法：/bushabit [clear]"""
+        umo = event.unified_msg_origin
+        if action.strip().lower() in ("clear", "清空", "重置", "reset"):
+            self.profile.clear(umo, places=False, observations=True)
+            yield event.plain_result(
+                "🧹 已清空出行记录。家 / 公司的地点记忆还在，可用 /busplace clear 清除"
+            )
+            return
+
+        stats = self.profile.stats(umo)
+        yield event.plain_result(
+            f"{self.profile.describe(umo)}\n\n"
+            f"📊 出行记录 {stats['observations']} 条"
+            f" · 家 {'✓' if stats['home'] else '—'}"
+            f" · 公司 {'✓' if stats['work'] else '—'}"
+            f" · 常去 {stats['frequent']} 个\n"
+            "· 清空记录：/bushabit clear\n"
+            "· 设置家 / 公司：/busplace home 市政府"
+        )
+
+    @filter.command("busplace")
+    async def busplace(self, event: AstrMessageEvent, action: str = "", name: str = ""):
+        """查看 / 设置地点记忆。用法：/busplace [home|work|frequent 站名] 或 /busplace clear [类型]"""
+        umo = event.unified_msg_origin
+        action = (action or "").strip()
+        name = (name or "").strip()
+
+        if not action:
+            yield event.plain_result(
+                f"{self._describe_places(umo)}\n\n"
+                "设置：/busplace home 市政府\n"
+                "     /busplace work 附小\n"
+                "清除：/busplace clear home  或  /busplace clear"
+            )
+            return
+
+        if action.lower() in ("clear", "清空"):
+            role = self._place_role(name)
+            if role:
+                removed = self.profile.remove_place(umo, role)
+                yield event.plain_result(
+                    f"🧹 已清除{self._place_label(role)}的站点记忆"
+                    if removed
+                    else f"本来就没有记录{self._place_label(role)}"
+                )
+                return
+            for item in ("home", "work", "frequent"):
+                self.profile.remove_place(umo, item)
+            yield event.plain_result("🧹 已清空全部地点记忆")
+            return
+
+        role = self._place_role(action)
+        if role is None:
+            yield event.plain_result(
+                "地点类型只能是 home（家）/ work（公司）/ frequent（常去）"
+            )
+            return
+        if not name:
+            yield event.plain_result(
+                f"请在后面跟上站名，例如：/busplace {action} 市政府"
+            )
+            return
+
+        record = self.profile.set_place(umo, role, name, city=self._city_for(event))
+        if record is None:
+            yield event.plain_result("站名不能为空")
+            return
+        yield event.plain_result(
+            f"✅ 已记住：{self._place_label(role)} = {record['name']}\n"
+            "之后问「XX路到哪了」时，插件会参考这些地点来判断方向"
+        )
+
+    @staticmethod
+    def _place_role(token: str) -> str | None:
+        lowered = (token or "").strip().lower()
+        if lowered in ("home", "家", "住家", "住所", "我家"):
+            return "home"
+        if lowered in ("work", "公司", "单位", "上班", "公司站"):
+            return "work"
+        if lowered in ("frequent", "常去", "常去地点"):
+            return "frequent"
+        return None
+
+    @staticmethod
+    def _place_label(role: str) -> str:
+        return {"home": "家", "work": "公司", "frequent": "常去"}.get(role, role)
+
+    def _describe_places(self, umo: str) -> str:
+        places = self.profile.places(umo)
+        home = places.get("home")
+        work = places.get("work")
+        lines = [
+            "🗺 地点记忆",
+            f"  · 家：{home['name']}（{home['source']}）" if home else "  · 家：还没有",
+            f"  · 公司：{work['name']}（{work['source']}）"
+            if work
+            else "  · 公司：还没有",
+        ]
+        frequent = places.get("frequent") or []
+        if frequent:
+            names = "、".join(str(item.get("name")) for item in frequent)
+            lines.append(f"  · 常去：{names}")
+        return "\n".join(lines)
 
     @filter.command("busstop")
     async def busstop(self, event: AstrMessageEvent):
