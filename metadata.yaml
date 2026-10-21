@@ -2,7 +2,7 @@ name: astrbot_plugin_bus_alarm
 display_name: 公交赶车闹钟
 desc: 按自定义时间与日期规则，主动推送候车站最近数辆公交车的到站信息，并附一张标注线路走向与实时车辆位置的地图。也可用自然语言直接问「X路到哪了」，或说「每天早上7点半提醒我1路」来创建、修改、删除提醒；插件会自学出行习惯、记住家与公司并在没说方向时自动判断。覆盖全国 500+ 城市，支持法定节假日与调休补班日，自带 WebUI 插件页面。
 short_desc: 公交到站提醒，到点推送最近几辆车还有几站，附带线路地图，支持自然语言查询与订阅管理，全国可用。
-version: v1.5.0
+version: v1.6.0
 author: 星见雅
 repo: https://github.com/HSOS6/astrbot_plugin_bus_alarm
 tags:
@@ -10,7 +10,7 @@ tags:
   - 公共交通
   - 定时提醒
   - 地图
-astrbot_version: ">=4.0.0"
+astrbot_version: ">=4.5.1"
 support_platforms:
   - aiocqhttp
   - qq_official
